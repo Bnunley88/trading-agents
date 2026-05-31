@@ -24,6 +24,54 @@ def get_news_sentiment(symbol, company_name):
     except:
         return "News fetch failed"
 
+def get_earnings_info(ticker_obj):
+    try:
+        calendar = ticker_obj.calendar
+        if calendar is None or calendar.empty:
+            return "No earnings data"
+        earnings_date = calendar.iloc[0]["Earnings Date"]
+        if isinstance(earnings_date, list):
+            earnings_date = earnings_date[0]
+        days_until = (earnings_date - datetime.now()).days
+        if days_until < 0:
+            return "Earnings passed"
+        elif days_until <= 3:
+            return f"⚠️ EARNINGS IN {days_until} DAYS - HIGH VOLATILITY EXPECTED"
+        elif days_until <= 7:
+            return f"📅 Earnings in {days_until} days - watch closely"
+        else:
+            return f"Earnings in {days_until} days"
+    except:
+        return "Earnings data unavailable"
+
+def get_insider_activity(ticker_obj):
+    try:
+        insider = ticker_obj.insider_purchases
+        if insider is None or insider.empty:
+            return "No insider data"
+        recent = insider.head(3)
+        buys = recent[recent["Transaction"] == "Buy"]
+        if not buys.empty:
+            total = buys["Value"].sum()
+            return f"🟢 Insider buying detected! ${total:,.0f} purchased recently"
+        return "No recent insider buying"
+    except:
+        return "Insider data unavailable"
+
+def get_analyst_rating(ticker_obj):
+    try:
+        recommendations = ticker_obj.recommendations
+        if recommendations is None or recommendations.empty:
+            return "No analyst data"
+        recent = recommendations.tail(5)
+        upgrades = recent[recent["To Grade"].isin(["Buy", "Strong Buy", "Outperform", "Overweight"])]
+        if not upgrades.empty:
+            latest = upgrades.iloc[-1]
+            return f"🟢 {latest['Firm']} rates {latest['To Grade']}"
+        return "No recent upgrades"
+    except:
+        return "Analyst data unavailable"
+
 def research_stocks():
     watchlist = ["AAPL", "MSFT", "TSLA", "NVDA", "AMZN", "GOOGL", "META"]
     results = []
@@ -62,14 +110,20 @@ def research_stocks():
                 volume_ratio = round(volume / avg_volume, 2)
 
             news = get_news_sentiment(symbol, name)
+            earnings = get_earnings_info(ticker)
+            insider = get_insider_activity(ticker)
+            analyst = get_analyst_rating(ticker)
 
             summary = (
                 f"{name} ({symbol}): Price=${price}, PE={pe_ratio}, "
                 f"52W High={week_high}, 52W Low={week_low}, "
                 f"RSI={rsi}, 5-Day Momentum={momentum}%, "
                 f"Volume Ratio={volume_ratio}x avg, "
-                f"Market Cap={market_cap}, "
-                f"Recent News: {news}"
+                f"Market Cap={market_cap}\n"
+                f"  Earnings: {earnings}\n"
+                f"  Insider Activity: {insider}\n"
+                f"  Analyst Rating: {analyst}\n"
+                f"  News: {news}"
             )
             results.append({"symbol": symbol, "summary": summary})
 
@@ -81,10 +135,14 @@ def research_stocks():
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {"role": "system", "content": """You are an expert stock research analyst. 
-Analyze stocks using price action, RSI, momentum, volume, and news sentiment.
+            {"role": "system", "content": """You are an expert stock research analyst.
+Analyze stocks using technical indicators, earnings timing, insider activity, and analyst ratings.
 RSI below 30 = oversold (potential buy). RSI above 70 = overbought (avoid).
-High volume ratio = strong interest. Positive momentum = uptrend.
+High volume ratio = strong institutional interest.
+Insider buying = very bullish signal.
+Analyst upgrades = momentum catalyst.
+Stocks with earnings in 1-3 days = HIGH RISK, avoid unless strong conviction.
+Stocks with earnings in 4-7 days = potential opportunity for pre-earnings run.
 Always end your response with BEST_PICK: followed by just the ticker symbol."""},
             {"role": "user", "content": f"Analyze these stocks and pick the single best buy opportunity today:\n{research_data}"}
         ]
