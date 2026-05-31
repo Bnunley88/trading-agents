@@ -37,4 +37,4 @@ def research_stocks():
             name = info.get("longName", symbol)
             price = info.get("currentPrice", "N/A")
             pe_ratio = info.get("trailingPE", "N/A")
-            week_high = info.get("fiftyTwoWeekHigh
+            week_high = info.get("fiftyTwoWeekHigh", "N/A")
