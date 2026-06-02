@@ -12,23 +12,18 @@ api = tradeapi.REST(
 )
 
 def get_position_size(symbol, risk_pct=0.02):
-    """Calculate shares to buy based on 2% portfolio risk"""
     try:
         account = api.get_account()
         portfolio_value = float(account.portfolio_value)
         risk_amount = portfolio_value * risk_pct
-
         quote = api.get_latest_trade(symbol)
         price = float(quote.price)
-
         shares = int(risk_amount / price)
-        shares = max(1, shares)  # Always buy at least 1 share
-
+        shares = max(1, shares)
         print(f"💼 Portfolio Value: ${portfolio_value:,.2f}")
         print(f"⚠️ Risk Amount (2%): ${risk_amount:,.2f}")
         print(f"💲 {symbol} Price: ${price:,.2f}")
         print(f"📦 Shares to Buy: {shares}")
-
         return shares
     except Exception as e:
         print(f"Position sizing error: {e}, defaulting to 1 share")
@@ -38,7 +33,6 @@ def execute_trade(symbol, shares=None):
     try:
         if shares is None:
             shares = get_position_size(symbol)
-
         order = api.submit_order(
             symbol=symbol,
             qty=shares,
@@ -46,6 +40,14 @@ def execute_trade(symbol, shares=None):
             type="market",
             time_in_force="day"
         )
-
         print(f"EXECUTOR AGENT: Order placed!")
         print(f"Symbol: {symbol}")
+        print(f"Shares: {shares}")
+        print(f"Order ID: {order.id}")
+        return order
+    except Exception as e:
+        print(f"EXECUTOR AGENT ERROR: {e}")
+        return None
+
+if __name__ == "__main__":
+    execute_trade("MSFT")
