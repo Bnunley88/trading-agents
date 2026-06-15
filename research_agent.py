@@ -132,7 +132,7 @@ def research_stocks():
 
     research_data = "\n".join([r["summary"] for r in results])
 
-    response = client.chat.completions.create(
+response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
             {"role": "system", "content": """You are an expert stock research analyst.
@@ -143,22 +143,37 @@ Insider buying = very bullish signal.
 Analyst upgrades = momentum catalyst.
 Stocks with earnings in 1-3 days = HIGH RISK, avoid unless strong conviction.
 Stocks with earnings in 4-7 days = potential opportunity for pre-earnings run.
-Always end your response with BEST_PICK: followed by just the ticker symbol."""},
-            {"role": "user", "content": f"Analyze these stocks and pick the single best buy opportunity today:\n{research_data}"}
+Always end your response with:
+TOP_PICKS:
+1: TICKER
+2: TICKER
+3: TICKER"""},
+            {"role": "user", "content": f"Analyze these stocks and pick the top 3 buy opportunities today:\n{research_data}"}
         ]
     )
 
     recommendation = response.choices[0].message.content
 
-    best_pick = "MSFT"
-    if "BEST_PICK:" in recommendation:
-        best_pick = recommendation.split("BEST_PICK:")[-1].strip().split()[0]
+    # Parse top 3 picks
+    top_picks = []
+    if "TOP_PICKS:" in recommendation:
+        lines = recommendation.split("TOP_PICKS:")[-1].strip().split("\n")
+        for line in lines:
+            line = line.strip()
+            if line and ":" in line:
+                ticker = line.split(":")[-1].strip().split()[0]
+                if ticker:
+                    top_picks.append(ticker)
+
+    # Fallback if parsing fails
+    if len(top_picks) < 3:
+        top_picks = ["AAPL", "MSFT", "NVDA"]
 
     print("RESEARCH AGENT REPORT:")
     print(recommendation)
-    print(f"\nBEST PICK TODAY: {best_pick}")
+    print(f"\nTOP 3 PICKS TODAY: {top_picks}")
 
-    return {"report": recommendation, "symbol": best_pick}
+    return {"report": recommendation, "symbols": top_picks}
 
 if __name__ == "__main__":
     research_stocks()
