@@ -49,5 +49,14 @@ def execute_trade(symbol, shares=None):
         print(f"EXECUTOR AGENT ERROR: {e}")
         return None
 
+def execute_trades(symbols):
+    orders = []
+    for symbol in symbols:
+        print(f"\n⚡ Trading {symbol}...")
+        order = execute_trade(symbol)
+        if order:
+            orders.append({"symbol": symbol, "order": order})
+    return orders
+
 if __name__ == "__main__":
-    execute_trade("MSFT")
+    execute_trades(["AAPL", "MSFT", "NVDA"])
