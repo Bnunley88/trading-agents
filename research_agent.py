@@ -132,7 +132,7 @@ def research_stocks():
 
     research_data = "\n".join([r["summary"] for r in results])
 
-response = client.chat.completions.create(
+    response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
             {"role": "system", "content": """You are an expert stock research analyst.
@@ -151,7 +151,6 @@ TOP_PICKS:
             {"role": "user", "content": f"Analyze these stocks and pick the top 3 buy opportunities today:\n{research_data}"}
         ]
     )
-
     recommendation = response.choices[0].message.content
 
     # Parse top 3 picks
