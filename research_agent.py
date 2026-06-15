@@ -80,7 +80,7 @@ def research_stocks():
         try:
             ticker = yf.Ticker(symbol)
             info = ticker.info
-            hist = ticker.history(period="10d")
+            hist = ticker.history(period="30d")  # FIXED: was 10d
 
             name = info.get("longName", symbol)
             price = info.get("currentPrice", "N/A")
@@ -97,10 +97,10 @@ def research_stocks():
                 closes = hist["Close"].tolist()
                 momentum = round(((closes[-1] - closes[0]) / closes[0]) * 100, 2)
 
-            if len(hist) >= 10:
+            if len(hist) >= 15:  # FIXED: was 10
                 delta = hist["Close"].diff()
-                gain = delta.clip(lower=0).rolling(window=7).mean()
-                loss = (-delta.clip(upper=0)).rolling(window=7).mean()
+                gain = delta.clip(lower=0).rolling(window=14).mean()  # FIXED: was 7
+                loss = (-delta.clip(upper=0)).rolling(window=14).mean()  # FIXED: was 7
                 rs = gain / loss
                 rsi_series = 100 - (100 / (1 + rs))
                 rsi = round(rsi_series.iloc[-1], 1)
