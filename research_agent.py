@@ -80,7 +80,7 @@ def research_stocks():
         try:
             ticker = yf.Ticker(symbol)
             info = ticker.info
-            hist = ticker.history(period="30d")  # FIXED: was 10d
+            hist = ticker.history(period="30d")
 
             name = info.get("longName", symbol)
             price = info.get("currentPrice", "N/A")
@@ -97,10 +97,10 @@ def research_stocks():
                 closes = hist["Close"].tolist()
                 momentum = round(((closes[-1] - closes[0]) / closes[0]) * 100, 2)
 
-            if len(hist) >= 15:  # FIXED: was 10
+            if len(hist) >= 15:
                 delta = hist["Close"].diff()
-                gain = delta.clip(lower=0).rolling(window=14).mean()  # FIXED: was 7
-                loss = (-delta.clip(upper=0)).rolling(window=14).mean()  # FIXED: was 7
+                gain = delta.clip(lower=0).rolling(window=14).mean()
+                loss = (-delta.clip(upper=0)).rolling(window=14).mean()
                 rs = gain / loss
                 rsi_series = 100 - (100 / (1 + rs))
                 rsi = round(rsi_series.iloc[-1], 1)
@@ -151,9 +151,9 @@ TOP_PICKS:
             {"role": "user", "content": f"Analyze these stocks and pick the top 3 buy opportunities today:\n{research_data}"}
         ]
     )
+
     recommendation = response.choices[0].message.content
 
-    # Parse top 3 picks
     top_picks = []
     if "TOP_PICKS:" in recommendation:
         lines = recommendation.split("TOP_PICKS:")[-1].strip().split("\n")
@@ -164,7 +164,6 @@ TOP_PICKS:
                 if ticker:
                     top_picks.append(ticker)
 
-    # Fallback if parsing fails
     if len(top_picks) < 3:
         top_picks = ["AAPL", "MSFT", "NVDA"]
 
