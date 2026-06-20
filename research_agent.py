@@ -9,6 +9,7 @@ load_dotenv()
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 
 def get_news_sentiment(symbol, company_name):
     if not NEWS_API_KEY:
@@ -72,6 +73,44 @@ def get_analyst_rating(ticker_obj):
     except:
         return "Analyst data unavailable"
 
+def get_finnhub_data(symbol):
+    """
+    Cross-check source, independent of yfinance. Pulls a live quote plus a
+    few key metrics from Finnhub so research_stocks() isn't relying on a
+    single data provider for price/technical context.
+    """
+    if not FINNHUB_API_KEY:
+        return "No Finnhub data available"
+    try:
+        quote_url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_API_KEY}"
+        quote_resp = requests.get(quote_url, timeout=5)
+        quote = quote_resp.json()
+
+        current = quote.get("c", "N/A")
+        prev_close = quote.get("pc", "N/A")
+        day_high = quote.get("h", "N/A")
+        day_low = quote.get("l", "N/A")
+
+        change_pct = "N/A"
+        if current not in ("N/A", None) and prev_close not in ("N/A", None, 0):
+            change_pct = round(((current - prev_close) / prev_close) * 100, 2)
+
+        metric_url = f"https://finnhub.io/api/v1/stock/metric?symbol={symbol}&metric=all&token={FINNHUB_API_KEY}"
+        metric_resp = requests.get(metric_url, timeout=5)
+        metrics = metric_resp.json().get("metric", {})
+
+        beta = metrics.get("beta", "N/A")
+        week52_high = metrics.get("52WeekHigh", "N/A")
+        week52_low = metrics.get("52WeekLow", "N/A")
+
+        return (
+            f"Finnhub Price=${current} (Day Change={change_pct}%), "
+            f"Day Range=${day_low}-${day_high}, "
+            f"Beta={beta}, 52W High/Low (Finnhub)=${week52_high}/${week52_low}"
+        )
+    except Exception as e:
+        return f"Finnhub data unavailable ({e})"
+
 def research_stocks():
     watchlist = ["AAPL", "MSFT", "TSLA", "NVDA", "AMZN", "GOOGL", "META"]
     results = []
@@ -113,6 +152,7 @@ def research_stocks():
             earnings = get_earnings_info(ticker)
             insider = get_insider_activity(ticker)
             analyst = get_analyst_rating(ticker)
+            finnhub = get_finnhub_data(symbol)
 
             summary = (
                 f"{name} ({symbol}): Price=${price}, PE={pe_ratio}, "
@@ -123,7 +163,8 @@ def research_stocks():
                 f"  Earnings: {earnings}\n"
                 f"  Insider Activity: {insider}\n"
                 f"  Analyst Rating: {analyst}\n"
-                f"  News: {news}"
+                f"  News: {news}\n"
+                f"  Cross-check: {finnhub}"
             )
             results.append({"symbol": symbol, "summary": summary})
 
@@ -143,6 +184,10 @@ Insider buying = very bullish signal.
 Analyst upgrades = momentum catalyst.
 Stocks with earnings in 1-3 days = HIGH RISK, avoid unless strong conviction.
 Stocks with earnings in 4-7 days = potential opportunity for pre-earnings run.
+The "Cross-check" line is an independent secondary data source (Finnhub) for
+the price/volatility data -- use it to sanity-check the primary numbers above
+it, and weigh it as one more input. If it strongly disagrees with the primary
+data, treat that as a flag of uncertainty rather than fully trusting either source.
 Always end your response with:
 TOP_PICKS:
 1: TICKER
