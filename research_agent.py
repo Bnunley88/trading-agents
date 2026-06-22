@@ -1,4 +1,5 @@
 import os
+import re
 import yfinance as yf
 import requests
 from openai import OpenAI
@@ -10,6 +11,63 @@ load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+
+MIN_MARKET_CAP = 10_000_000_000
+
+FALLBACK_WATCHLIST = [
+    "AAPL", "MSFT", "NVDA", "META", "TSLA", "AMZN", "GOOGL",
+    "AMD", "AVGO", "MU", "CRM", "ORCL", "NOW", "UBER", "SHOP",
+    "PLTR", "COIN", "ARM", "SMCI", "NFLX",
+    "JPM", "V", "MA", "GS", "PYPL",
+    "UNH", "LLY", "JNJ",
+    "XOM", "CVX",
+    "BA", "CAT", "HD", "WMT", "NKE", "DIS", "DASH", "SNOW",
+    "MARA", "HOOD"
+]
+
+def get_dynamic_watchlist(top_n=20):
+    try:
+        url = "https://data.alpaca.markets/v1beta1/screener/stocks/most-actives"
+        headers = {
+            "APCA-API-KEY-ID": ALPACA_API_KEY,
+            "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY
+        }
+        params = {"top": 50, "by": "volume"}
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        data = response.json()
+
+        candidates = data.get("most_actives", [])
+        if not candidates:
+            print("⚠️ Alpaca screener returned no results, using fallback watchlist.")
+            return FALLBACK_WATCHLIST
+
+        filtered = []
+        for stock in candidates:
+            symbol = stock.get("symbol", "")
+            if not symbol or "." in symbol:
+                continue
+            try:
+                info = yf.Ticker(symbol).info
+                market_cap = info.get("marketCap", 0) or 0
+                if market_cap >= MIN_MARKET_CAP:
+                    filtered.append(symbol)
+                if len(filtered) >= top_n:
+                    break
+            except:
+                continue
+
+        if len(filtered) < 3:
+            print("⚠️ Not enough candidates after filtering, using fallback watchlist.")
+            return FALLBACK_WATCHLIST
+
+        print(f"📋 Dynamic watchlist ({len(filtered)} stocks): {filtered}")
+        return filtered
+
+    except Exception as e:
+        print(f"⚠️ Alpaca screener failed ({e}), using fallback watchlist.")
+        return FALLBACK_WATCHLIST
 
 def get_news_sentiment(symbol, company_name):
     if not NEWS_API_KEY:
@@ -74,11 +132,6 @@ def get_analyst_rating(ticker_obj):
         return "Analyst data unavailable"
 
 def get_finnhub_data(symbol):
-    """
-    Cross-check source, independent of yfinance. Pulls a live quote plus a
-    few key metrics from Finnhub so research_stocks() isn't relying on a
-    single data provider for price/technical context.
-    """
     if not FINNHUB_API_KEY:
         return "No Finnhub data available"
     try:
@@ -112,7 +165,8 @@ def get_finnhub_data(symbol):
         return f"Finnhub data unavailable ({e})"
 
 def research_stocks():
-    watchlist = ["AAPL", "MSFT", "TSLA", "NVDA", "AMZN", "GOOGL", "META"]
+    print("🔍 Building dynamic watchlist from Alpaca most-actives screener...")
+    watchlist = get_dynamic_watchlist(top_n=20)
     results = []
 
     for symbol in watchlist:
@@ -188,7 +242,7 @@ The "Cross-check" line is an independent secondary data source (Finnhub) for
 the price/volatility data -- use it to sanity-check the primary numbers above
 it, and weigh it as one more input. If it strongly disagrees with the primary
 data, treat that as a flag of uncertainty rather than fully trusting either source.
-Always end your response with:
+Always end your response with EXACTLY this format, no bold, no company names, no periods:
 TOP_PICKS:
 1: TICKER
 2: TICKER
@@ -204,10 +258,17 @@ TOP_PICKS:
         lines = recommendation.split("TOP_PICKS:")[-1].strip().split("\n")
         for line in lines:
             line = line.strip()
-            if line and ":" in line:
-                ticker = line.split(":")[-1].strip().split()[0]
-                if ticker:
-                    top_picks.append(ticker)
+            if not line:
+                continue
+            line = line.replace("**", "").replace("*", "")
+            matches = re.findall(r'\b[A-Z]{2,5}\b', line)
+            for match in matches:
+                if match not in ("TOP", "PICKS", "RSI", "CEO", "ETF", "NYSE", "NA"):
+                    if match not in top_picks:
+                        top_picks.append(match)
+                        break
+            if len(top_picks) >= 3:
+                break
 
     if len(top_picks) < 3:
         top_picks = ["AAPL", "MSFT", "NVDA"]
