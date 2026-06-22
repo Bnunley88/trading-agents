@@ -1,12 +1,23 @@
+import os
 import schedule
 import time
 import threading
+import alpaca_trade_api as tradeapi
+from dotenv import load_dotenv
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from research_agent import research_stocks
 from analyst_agent import analyze_recommendation
 from executor_agent import execute_trades
 from monitor_agent import monitor_position
 from exit_agent import exit_trade
+
+load_dotenv()
+
+api = tradeapi.REST(
+    os.getenv("ALPACA_API_KEY"),
+    os.getenv("ALPACA_SECRET_KEY"),
+    os.getenv("ALPACA_BASE_URL")
+)
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -24,29 +35,80 @@ threading.Thread(target=run_health_server, daemon=True).start()
 print("✅ Health server running on port 8080")
 
 todays_symbols = []
-high_water_marks = {}  # tracks the highest price seen per symbol since entry today
+high_water_marks = {}
 
-TRAILING_STOP_PCT = 2.0   # sell if price drops this % from the peak since entry
-HARD_PROFIT_CEILING = 5.0  # backstop: sell immediately if gain ever hits this %, no matter what
+TRAILING_STOP_PCT = 2.0
+HARD_PROFIT_CEILING = 5.0
+MAX_POSITIONS = 3
+MIN_BUYING_POWER = 1000.0
 
 def run_morning_session():
     global todays_symbols, high_water_marks
     print("\n🌅 MORNING SESSION - 9:35 AM")
     print("="*50)
 
+    try:
+        # Check existing open positions and buying power
+        existing_positions = api.list_positions()
+        existing_symbols = [p.symbol for p in existing_positions]
+        account = api.get_account()
+        buying_power = float(account.buying_power)
+
+        print(f"💼 Open positions: {existing_symbols}")
+        print(f"💵 Buying power: ${buying_power:,.2f}")
+
+        # If buying power is too low, skip buying and just monitor
+        if buying_power < MIN_BUYING_POWER:
+            print(f"⚠️ Buying power ${buying_power:,.2f} below minimum ${MIN_BUYING_POWER:,.2f} — skipping new buys.")
+            todays_symbols = existing_symbols
+            high_water_marks = {}
+            for symbol in todays_symbols:
+                check_position(symbol)
+            print("\n✅ MORNING SESSION COMPLETE (no new buys — low buying power)")
+            return
+
+        # If already at max positions, skip buying and just monitor
+        if len(existing_positions) >= MAX_POSITIONS:
+            print(f"⚠️ Already at max {MAX_POSITIONS} positions — skipping new buys.")
+            todays_symbols = existing_symbols
+            high_water_marks = {}
+            for symbol in todays_symbols:
+                check_position(symbol)
+            print("\n✅ MORNING SESSION COMPLETE (no new buys — max positions reached)")
+            return
+
+    except Exception as e:
+        print(f"⚠️ Could not check positions/buying power ({e}), proceeding normally.")
+        existing_symbols = []
+
     print("\n📊 STEP 1: RESEARCHING STOCKS...")
     research_result = research_stocks()
     research_report = research_result["report"]
     top_symbols = research_result["symbols"]
-    todays_symbols = top_symbols
-    high_water_marks = {}  # reset tracking for the new day's positions
+
+    # Filter out symbols we already hold to keep portfolio diverse
+    slots_available = MAX_POSITIONS - len(existing_symbols)
+    new_symbols = [s for s in top_symbols if s not in existing_symbols][:slots_available]
+
+    if not new_symbols:
+        print(f"⚠️ All top picks already held — skipping new buys.")
+        todays_symbols = existing_symbols
+        high_water_marks = {}
+        for symbol in todays_symbols:
+            check_position(symbol)
+        print("\n✅ MORNING SESSION COMPLETE (no new buys — all picks already held)")
+        return
+
+    todays_symbols = existing_symbols + new_symbols
+    high_water_marks = {}
 
     print("\n🧠 STEP 2: ANALYZING OPPORTUNITIES...")
     decision = analyze_recommendation(research_report)
 
     print("\n⚡ STEP 3: EXECUTING TRADES...")
-    print(f"Trading today's top 3 picks: {top_symbols}")
-    execute_trades(top_symbols)
+    print(f"Already holding: {existing_symbols}")
+    print(f"New trades today: {new_symbols}")
+    execute_trades(new_symbols)
 
     print("\n👁️ STEP 4: MONITORING POSITIONS...")
     time.sleep(2)
@@ -88,7 +150,6 @@ def check_position(symbol):
     entry_price = position.get("entry_price", 0)
     pnl = position.get("profit_loss_pct", 0)
 
-    # Update the high water mark (highest price seen since entry today)
     if symbol not in high_water_marks or current_price > high_water_marks[symbol]:
         high_water_marks[symbol] = current_price
 
@@ -98,21 +159,18 @@ def check_position(symbol):
     print(f"📈 {symbol} | Current: ${current_price:.2f} | Entry: ${entry_price:.2f} | Peak: ${peak_price:.2f}")
     print(f"   P&L from entry: {pnl:.2f}% | Drop from peak: {drop_from_peak_pct:.2f}%")
 
-    # Hard backstop: sell immediately if gain ever hits the ceiling, regardless of trailing stop
     if pnl >= HARD_PROFIT_CEILING:
         print(f"💰 HARD PROFIT CEILING HIT! {symbol} Gain: {pnl:.2f}%")
         exit_trade(symbol)
         todays_symbols.remove(symbol)
         return
 
-    # Original fixed stop loss: protects against a position that never gained ground
     if pnl <= -2.0:
         print(f"🚨 STOP LOSS TRIGGERED! {symbol} Loss: {pnl:.2f}%")
         exit_trade(symbol)
         todays_symbols.remove(symbol)
         return
 
-    # Trailing stop: protects gains once the position has moved up from entry
     if peak_price > entry_price and drop_from_peak_pct <= -TRAILING_STOP_PCT:
         print(f"🛡️ TRAILING STOP TRIGGERED! {symbol} Locked in {pnl:.2f}% (down {abs(drop_from_peak_pct):.2f}% from peak ${peak_price:.2f})")
         exit_trade(symbol)
@@ -121,11 +179,9 @@ def check_position(symbol):
 
     print(f"⏳ Holding {symbol}. P&L within range.")
 
-# Morning session: research + buy + first check
 for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
     getattr(schedule.every(), day).at("09:35").do(run_morning_session)
 
-# Intraday checks every 30 minutes from 10:00 AM to 3:30 PM Central
 intraday_times = [
     "10:00", "10:30", "11:00", "11:30",
     "12:00", "12:30", "13:00", "13:30",
@@ -135,7 +191,6 @@ for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
     for t in intraday_times:
         getattr(schedule.every(), day).at(t).do(run_intraday_check, label=t)
 
-# Closing check
 for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
     getattr(schedule.every(), day).at("15:45").do(run_closing_check)
 
