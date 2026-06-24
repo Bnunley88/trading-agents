@@ -176,6 +176,14 @@ def run_morning_session():
     trailing_stops.update(new_stops)
     print(f"📐 Active trailing stops: {trailing_stops}")
 
+    if not top_symbols:
+        print("🛑 No quality picks today — sitting on cash, monitoring existing positions only.")
+        todays_symbols = existing_symbols
+        for symbol in todays_symbols:
+            check_position(symbol)
+        print("\n✅ MORNING SESSION COMPLETE (no new buys — no quality picks today)")
+        return
+
     slots_available = MAX_POSITIONS - len(existing_symbols)
     new_symbols     = [s for s in top_symbols if s not in existing_symbols][:slots_available]
 
