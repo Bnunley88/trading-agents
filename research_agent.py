@@ -199,13 +199,9 @@ def research_stocks():
     print("🔍 Building dynamic watchlist from Alpaca most-actives screener...")
     watchlist = get_dynamic_watchlist(top_n=20)
 
-    # Calibrate trailing stops for all candidates in parallel BEFORE
-    # the sequential yfinance/news loop — by the time GPT-4o is called
-    # every ticker has its optimal stop ready.
     calibration = calibrate_watchlist_parallel(watchlist)
 
     # Filter out tickers where the best possible avg P&L is still negative.
-    # These stocks don't work with this strategy regardless of stop placement.
     filtered_watchlist = []
     rejected = []
     for symbol in watchlist:
@@ -339,7 +335,8 @@ TOP_PICKS:
     for symbol in top_picks:
         optimal, _, best_avg_pnl = calibration.get(symbol, (TRAILING_STOP_PCT, "", 0.0))
         trailing_stops[symbol]    = optimal
-        conviction_scores[symbol] = best_avg_pnl if best_avg_pnl is not None else 0.0
+        # FIX: cast to plain float to avoid np.float64 leaking into logs
+        conviction_scores[symbol] = float(best_avg_pnl) if best_avg_pnl is not None else 0.0
 
     print("RESEARCH AGENT REPORT:")
     print(recommendation)
