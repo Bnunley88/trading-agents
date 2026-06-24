@@ -11,12 +11,20 @@ from backtest import calibrate_trailing_stop, TRAILING_STOP_PCT
 load_dotenv()
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-NEWS_API_KEY    = os.getenv("NEWS_API_KEY")
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
-ALPACA_API_KEY  = os.getenv("ALPACA_API_KEY")
+NEWS_API_KEY      = os.getenv("NEWS_API_KEY")
+FINNHUB_API_KEY   = os.getenv("FINNHUB_API_KEY")
+ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 
 MIN_MARKET_CAP = 10_000_000_000
+
+# ---- QUALITY FILTERS ----
+# Minimum backtest avg P&L to pass — filters out barely-positive stocks
+MIN_CONVICTION_SCORE = 0.5
+# Minimum calibrated trailing stop % — filters out choppy stocks
+MIN_TRAILING_STOP    = 3.0
+# Hard block earnings within this many days
+EARNINGS_BLOCK_DAYS  = 5
 
 FALLBACK_WATCHLIST = [
     "AAPL", "MSFT", "NVDA", "META", "TSLA", "AMZN", "GOOGL",
@@ -70,6 +78,28 @@ def get_dynamic_watchlist(top_n=20):
     except Exception as e:
         print(f"⚠️ Alpaca screener failed ({e}), using fallback watchlist.")
         return FALLBACK_WATCHLIST
+
+
+def check_earnings_block(symbol):
+    """
+    Returns (blocked: bool, days_until: int or None).
+    Hard blocks any stock with earnings within EARNINGS_BLOCK_DAYS.
+    """
+    try:
+        ticker    = yf.Ticker(symbol)
+        calendar  = ticker.calendar
+        if calendar is None or calendar.empty:
+            return False, None
+        earnings_date = calendar.iloc[0]["Earnings Date"]
+        if isinstance(earnings_date, list):
+            earnings_date = earnings_date[0]
+        days_until = (earnings_date - datetime.now()).days
+        if 0 <= days_until <= EARNINGS_BLOCK_DAYS:
+            return True, days_until
+        return False, days_until
+    except:
+        return False, None
+
 
 def get_news_sentiment(symbol, company_name):
     if not NEWS_API_KEY:
@@ -170,7 +200,6 @@ def calibrate_watchlist_parallel(watchlist):
     """
     Run calibrate_trailing_stop() on all tickers in parallel (8 workers).
     Returns { symbol: (optimal_pct, report_string, best_avg_pnl) }
-    best_avg_pnl is None if calibration was inconclusive.
     """
     print(f"\n📐 Calibrating trailing stops for {len(watchlist)} stocks in parallel...")
     calibration = {}
@@ -201,19 +230,71 @@ def research_stocks():
 
     calibration = calibrate_watchlist_parallel(watchlist)
 
-    # Filter out tickers where the best possible avg P&L is still negative.
-    filtered_watchlist = []
-    rejected = []
+    # ---- FILTER 1: Hard block earnings within EARNINGS_BLOCK_DAYS ----
+    earnings_blocked = []
+    post_earnings_filter = []
     for symbol in watchlist:
-        _, _, best_avg_pnl = calibration.get(symbol, (TRAILING_STOP_PCT, "", None))
-        if best_avg_pnl is None or best_avg_pnl > 0:
-            filtered_watchlist.append(symbol)
+        blocked, days = check_earnings_block(symbol)
+        if blocked:
+            earnings_blocked.append(f"{symbol} (earnings in {days}d)")
         else:
-            rejected.append(f"{symbol} ({best_avg_pnl:+.2f}%)")
+            post_earnings_filter.append(symbol)
+
+    if earnings_blocked:
+        print(f"🚫 Earnings blocked: {', '.join(earnings_blocked)}")
+
+    # ---- FILTER 2: Remove negative P&L stocks ----
+    # ---- FILTER 3: Remove low conviction (< MIN_CONVICTION_SCORE) ----
+    # ---- FILTER 4: Remove choppy stocks (trailing stop < MIN_TRAILING_STOP) ----
+    filtered_watchlist = []
+    rejected           = []
+    for symbol in post_earnings_filter:
+        optimal_stop, _, best_avg_pnl = calibration.get(symbol, (TRAILING_STOP_PCT, "", None))
+        pnl = float(best_avg_pnl) if best_avg_pnl is not None else None
+
+        if pnl is None:
+            # Inconclusive calibration — let it through, GPT-4o can judge
+            filtered_watchlist.append(symbol)
+            continue
+
+        if pnl <= 0:
+            rejected.append(f"{symbol} (negative P&L: {pnl:+.2f}%)")
+            continue
+
+        if pnl < MIN_CONVICTION_SCORE:
+            rejected.append(f"{symbol} (low conviction: {pnl:+.2f}% < {MIN_CONVICTION_SCORE}%)")
+            continue
+
+        if optimal_stop < MIN_TRAILING_STOP:
+            rejected.append(f"{symbol} (choppy: stop {optimal_stop}% < {MIN_TRAILING_STOP}% min)")
+            continue
+
+        filtered_watchlist.append(symbol)
 
     if rejected:
-        print(f"🚫 Filtered out (negative P&L at all stop values): {', '.join(rejected)}")
+        print(f"🚫 Filtered out: {', '.join(rejected)}")
+
+    # If filters are too aggressive and nothing passes, relax conviction only
+    # and let GPT-4o pick from whatever survived earnings + negative P&L filter
+    if not filtered_watchlist:
+        print("⚠️ All stocks filtered out — relaxing conviction threshold, keeping positive P&L only")
+        for symbol in post_earnings_filter:
+            _, _, best_avg_pnl = calibration.get(symbol, (TRAILING_STOP_PCT, "", None))
+            pnl = float(best_avg_pnl) if best_avg_pnl is not None else None
+            if pnl is None or pnl > 0:
+                filtered_watchlist.append(symbol)
+
     print(f"✅ Passing {len(filtered_watchlist)} stocks to GPT-4o: {filtered_watchlist}\n")
+
+    # If still nothing, skip trading today
+    if not filtered_watchlist:
+        print("🛑 No quality stocks found today — skipping trades.")
+        return {
+            "report":            "No quality stocks passed filters today.",
+            "symbols":           [],
+            "trailing_stops":    {},
+            "conviction_scores": {}
+        }
 
     results = []
 
@@ -256,7 +337,9 @@ def research_stocks():
             analyst  = get_analyst_rating(ticker)
             finnhub  = get_finnhub_data(symbol)
 
-            optimal_stop, cal_report, _ = calibration.get(symbol, (TRAILING_STOP_PCT, "", None))
+            optimal_stop, _, _ = calibration.get(symbol, (TRAILING_STOP_PCT, "", None))
+            _, _, best_avg_pnl = calibration.get(symbol, (TRAILING_STOP_PCT, "", None))
+            pnl_display        = f"{float(best_avg_pnl):+.2f}%" if best_avg_pnl is not None else "N/A"
 
             summary = (
                 f"{name} ({symbol}): Price=${price}, PE={pe_ratio}, "
@@ -269,7 +352,7 @@ def research_stocks():
                 f"  News: {news}\n"
                 f"  Cross-check: {finnhub}\n"
                 f"  Backtest-calibrated trailing stop: {optimal_stop}% "
-                f"(90-min grace period active after entry)"
+                f"(avg P&L: {pnl_display}, 90-min grace period active after entry)"
             )
             results.append({"symbol": symbol, "summary": summary,
                             "optimal_stop": optimal_stop})
@@ -288,23 +371,25 @@ RSI below 30 = oversold (potential buy). RSI above 70 = overbought (avoid).
 High volume ratio = strong institutional interest.
 Insider buying = very bullish signal.
 Analyst upgrades = momentum catalyst.
-Stocks with earnings in 1-3 days = HIGH RISK, avoid unless strong conviction.
-Stocks with earnings in 4-7 days = potential opportunity for pre-earnings run.
-The "Cross-check" line is an independent secondary data source (Finnhub) — use it
-to sanity-check the primary numbers. If it strongly disagrees, treat that as uncertainty.
-The "Backtest-calibrated trailing stop" shows the historically optimal trailing stop %
-for that specific ticker based on 30 days of intraday data, with a 90-minute grace
-period after entry (the trailing stop doesn't fire in the first 90 min, letting the
-stock settle). A higher value (3.5%+) means the stock trends cleanly and rewards
-patience. A lower value (2-2.5%) means it's choppy and tends to reverse quickly.
-Prefer stocks with higher calibrated stops as they tend to reach the profit ceiling
-more often than they hit the stop loss.
+Every stock shown has already passed a backtest quality filter:
+- Positive historical avg P&L of at least +0.5%
+- Calibrated trailing stop of at least 3.0% (meaning it trends cleanly, not choppy)
+- No earnings within 5 days
+These are pre-vetted high quality candidates. Pick the best 3 based on today's
+technical setup. If fewer than 3 look genuinely good today, pick fewer —
+it is better to sit on cash than force a bad trade.
+The "Backtest-calibrated trailing stop" and avg P&L show historical performance.
+Higher avg P&L = stronger historical edge. Higher trailing stop = cleaner trend.
 Always end your response with EXACTLY this format, no bold, no company names, no periods:
 TOP_PICKS:
 1: TICKER
 2: TICKER
-3: TICKER"""},
-            {"role": "user", "content": f"Analyze these stocks and pick the top 3 buy opportunities today:\n{research_data}"}
+3: TICKER
+If fewer than 3 qualify today, still use the format but only list the ones that do:
+TOP_PICKS:
+1: TICKER
+2: TICKER"""},
+            {"role": "user", "content": f"Analyze these stocks and pick the top buy opportunities today:\n{research_data}"}
         ]
     )
 
@@ -327,20 +412,26 @@ TOP_PICKS:
             if len(top_picks) >= 3:
                 break
 
-    if len(top_picks) < 3:
-        top_picks = ["AAPL", "MSFT", "NVDA"]
+    # No fallback to AAPL/MSFT/NVDA anymore — if nothing qualifies, sit on cash
+    if not top_picks:
+        print("🛑 GPT-4o found no quality picks today — sitting on cash.")
+        return {
+            "report":            recommendation,
+            "symbols":           [],
+            "trailing_stops":    {},
+            "conviction_scores": {}
+        }
 
     trailing_stops    = {}
     conviction_scores = {}
     for symbol in top_picks:
         optimal, _, best_avg_pnl = calibration.get(symbol, (TRAILING_STOP_PCT, "", 0.0))
         trailing_stops[symbol]    = optimal
-        # FIX: cast to plain float to avoid np.float64 leaking into logs
         conviction_scores[symbol] = float(best_avg_pnl) if best_avg_pnl is not None else 0.0
 
     print("RESEARCH AGENT REPORT:")
     print(recommendation)
-    print(f"\nTOP 3 PICKS TODAY: {top_picks}")
+    print(f"\nTOP PICKS TODAY: {top_picks}")
     print(f"📐 Calibrated trailing stops : {trailing_stops}")
     print(f"🎯 Conviction scores         : {conviction_scores}")
 
