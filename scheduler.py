@@ -37,35 +37,29 @@ threading.Thread(target=run_health_server, daemon=True).start()
 print("✅ Health server running on port 8080")
 
 # ---- STATE ----
-todays_symbols  = []
+todays_symbols   = []
 high_water_marks = {}
 entry_times      = {}   # { symbol: datetime } — used for grace period tracking
 trailing_stops   = {}   # { symbol: float }    — per-stock calibrated trailing stop %
 
 # ---- CONSTANTS ----
-HARD_PROFIT_CEILING      = 5.0
-STOP_LOSS_PCT            = 2.0
-TRAILING_STOP_PCT_DEFAULT = 2.0   # fallback when no calibration available
-GRACE_PERIOD_MINUTES     = 90     # trailing stop suppressed for 90 min after entry
-MAX_POSITIONS            = 3
-MIN_BUYING_POWER         = 1000.0
+HARD_PROFIT_CEILING       = 5.0
+STOP_LOSS_PCT             = 2.0
+TRAILING_STOP_PCT_DEFAULT = 2.0
+GRACE_PERIOD_MINUTES      = 90
+MAX_POSITIONS             = 3
+MIN_BUYING_POWER          = 1000.0
 
 # ---- OPTIONS FLAG ----
-# Set to True only after:
-#   - Live Alpaca account with options approval
-#   - Proven 4+ weeks of consistent paper results
-#   - Confirmed portfolio_value sizing (not buying_power)
 ENABLE_OPTIONS = False
-
 if ENABLE_OPTIONS:
     from options_agent import buy_call_option
 
 # ---- CALIBRATION CACHE ----
 CACHE_FILE    = "calibration_cache.json"
-CACHE_MAX_AGE = timedelta(hours=23)   # refresh daily, stale after 23h
+CACHE_MAX_AGE = timedelta(hours=23)
 
 def load_calibration_cache():
-    """Load cached trailing stops from disk. Returns {} if missing or stale."""
     try:
         with open(CACHE_FILE, "r") as f:
             data = json.load(f)
@@ -81,7 +75,6 @@ def load_calibration_cache():
         return {}
 
 def save_calibration_cache(stops_dict):
-    """Save trailing stops to disk with a timestamp."""
     try:
         data = {
             "saved_at": datetime.now().isoformat(),
@@ -95,16 +88,42 @@ def save_calibration_cache(stops_dict):
 
 
 def get_trailing_stop(symbol):
-    """Per-stock calibrated stop, falling back to global default."""
     return trailing_stops.get(symbol, TRAILING_STOP_PCT_DEFAULT)
 
 
 def is_in_grace_period(symbol):
-    """True if the position was entered less than GRACE_PERIOD_MINUTES ago."""
     if symbol not in entry_times:
         return False
     elapsed = (datetime.now() - entry_times[symbol]).total_seconds() / 60
     return elapsed < GRACE_PERIOD_MINUTES
+
+
+def sync_positions_from_alpaca():
+    """
+    Sync todays_symbols with whatever Alpaca actually shows as open.
+    This is the key fix — if the bot restarts mid-day or a new position
+    was bought but not tracked, this ensures we never miss monitoring it.
+    Called at the start of every intraday and closing check.
+    """
+    global todays_symbols
+    try:
+        open_positions = api.list_positions()
+        open_symbols   = [p.symbol for p in open_positions]
+
+        # Add any symbols Alpaca has open that we're not tracking
+        for symbol in open_symbols:
+            if symbol not in todays_symbols:
+                print(f"🔄 Sync: adding {symbol} to monitoring (found in Alpaca positions)")
+                todays_symbols.append(symbol)
+
+        # Remove any symbols we're tracking that Alpaca no longer has open
+        for symbol in list(todays_symbols):
+            if symbol not in open_symbols:
+                print(f"🔄 Sync: removing {symbol} from monitoring (no longer in Alpaca)")
+                todays_symbols.remove(symbol)
+
+    except Exception as e:
+        print(f"⚠️ Position sync failed ({e}), using cached todays_symbols")
 
 
 # ---- SESSIONS ----
@@ -143,18 +162,16 @@ def run_morning_session():
         print(f"⚠️ Could not check positions/buying power ({e}), proceeding normally.")
         existing_symbols = []
 
-    # ---- Load calibration from cache (fast) or recompute (slow) ----
     cached = load_calibration_cache()
     if cached:
         trailing_stops.update(cached)
         print(f"📐 Using cached trailing stops: {trailing_stops}")
-    # research_stocks() will run its own calibration and we merge below
 
     print("\n📊 STEP 1: RESEARCHING STOCKS + CALIBRATING TRAILING STOPS...")
-    research_result  = research_stocks()
-    research_report  = research_result["report"]
-    top_symbols      = research_result["symbols"]
-    new_stops        = research_result.get("trailing_stops", {})
+    research_result = research_stocks()
+    research_report = research_result["report"]
+    top_symbols     = research_result["symbols"]
+    new_stops       = research_result.get("trailing_stops", {})
 
     trailing_stops.update(new_stops)
     print(f"📐 Active trailing stops: {trailing_stops}")
@@ -187,19 +204,22 @@ def run_morning_session():
     for symbol in new_symbols:
         entry_times[symbol] = now
 
-    # ---- Options layer (dormant until ENABLE_OPTIONS = True) ----
+    # Options layer (dormant until ENABLE_OPTIONS = True)
     if ENABLE_OPTIONS and new_symbols:
         try:
-            account        = api.get_account()
+            account         = api.get_account()
             portfolio_value = float(account.portfolio_value)
-            top_pick       = new_symbols[0]
+            top_pick        = new_symbols[0]
             print(f"\n📈 OPTIONS: Buying call on top pick {top_pick}...")
             buy_call_option(top_pick, portfolio_value)
         except Exception as e:
             print(f"⚠️ OPTIONS: Skipping — {e}")
 
+    # Sync with Alpaca after executing to catch any fills
+    time.sleep(3)
+    sync_positions_from_alpaca()
+
     print("\n👁️ STEP 4: MONITORING POSITIONS...")
-    time.sleep(2)
     for symbol in todays_symbols:
         check_position(symbol)
 
@@ -207,33 +227,40 @@ def run_morning_session():
 
 
 def run_intraday_check(label):
+    global todays_symbols
+
+    # Always sync from Alpaca first — catches new buys, stops, and restarts
+    sync_positions_from_alpaca()
+
     if not todays_symbols:
         print(f"⚠️ No positions to monitor at {label}.")
         return
+
     print(f"\n🔄 INTRADAY CHECK - {label}")
     print("=" * 50)
-    for symbol in todays_symbols:
+    for symbol in list(todays_symbols):
         check_position(symbol)
 
 
 def run_closing_check():
     global todays_symbols, high_water_marks, trailing_stops, entry_times
+
+    # Sync from Alpaca before closing check
+    sync_positions_from_alpaca()
+
     if not todays_symbols:
         print("⚠️ No positions to monitor at close.")
         return
+
     print("\n🌆 CLOSING CHECK - 3:45 PM")
     print("=" * 50)
 
     for symbol in list(todays_symbols):
         check_position(symbol)
 
-    # Save calibration cache at end of day so tomorrow's morning session
-    # can skip recomputing and go straight to the research loop.
     if trailing_stops:
         save_calibration_cache(trailing_stops)
 
-    # Reset intraday state but keep trailing_stops — overnight positions
-    # need their calibrated stop available at tomorrow morning's first check.
     todays_symbols   = []
     high_water_marks = {}
     entry_times      = {}
@@ -272,19 +299,16 @@ def check_position(symbol):
         entry_times.pop(symbol, None)
         high_water_marks.pop(symbol, None)
 
-    # Hard profit ceiling — always active
     if pnl >= HARD_PROFIT_CEILING:
         print(f"💰 HARD PROFIT CEILING HIT! {symbol} +{pnl:.2f}%")
         _exit("HARD_CEILING")
         return
 
-    # Hard stop loss — always active (even in grace period)
     if pnl <= -STOP_LOSS_PCT:
         print(f"🚨 STOP LOSS TRIGGERED! {symbol} {pnl:.2f}%")
         _exit("STOP_LOSS")
         return
 
-    # Trailing stop — suppressed during grace period
     if (not grace_active
             and peak_price > entry_price
             and drop_from_peak_pct <= -trailing_stop_pct):
@@ -315,7 +339,7 @@ for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
 
 print("⏰ SCHEDULER RUNNING")
 print("🌅 Morning session: 9:35 AM (calibration loaded from cache if fresh)")
-print("🔄 Intraday checks: every 30 min, 10:00 AM - 3:30 PM")
+print("🔄 Intraday checks: every 30 min, 10:00 AM - 3:30 PM (syncs from Alpaca each time)")
 print("🌆 Closing check: 3:45 PM (saves calibration cache for tomorrow)")
 print(f"🛡️ Stop Loss: -{STOP_LOSS_PCT}% (always active)")
 print(f"⏸️  Grace period: {GRACE_PERIOD_MINUTES} min after entry (trailing stop suppressed)")
