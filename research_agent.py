@@ -20,9 +20,9 @@ MIN_MARKET_CAP = 10_000_000_000
 
 # ---- QUALITY FILTERS ----
 # Minimum backtest avg P&L to pass — filters out barely-positive stocks
-MIN_CONVICTION_SCORE = 0.5
+MIN_CONVICTION_SCORE = 0.25   # lowered from 0.5 — was too aggressive
 # Minimum calibrated trailing stop % — filters out choppy stocks
-MIN_TRAILING_STOP    = 3.0
+MIN_TRAILING_STOP    = 2.5    # lowered from 3.0 — was blocking good stocks like SOFI/AAL
 # Hard block earnings within this many days
 EARNINGS_BLOCK_DAYS  = 5
 
@@ -253,7 +253,6 @@ def research_stocks():
         pnl = float(best_avg_pnl) if best_avg_pnl is not None else None
 
         if pnl is None:
-            # Inconclusive calibration — let it through, GPT-4o can judge
             filtered_watchlist.append(symbol)
             continue
 
@@ -274,8 +273,7 @@ def research_stocks():
     if rejected:
         print(f"🚫 Filtered out: {', '.join(rejected)}")
 
-    # If filters are too aggressive and nothing passes, relax conviction only
-    # and let GPT-4o pick from whatever survived earnings + negative P&L filter
+    # If filters are too aggressive and nothing passes, relax to positive P&L only
     if not filtered_watchlist:
         print("⚠️ All stocks filtered out — relaxing conviction threshold, keeping positive P&L only")
         for symbol in post_earnings_filter:
@@ -286,7 +284,6 @@ def research_stocks():
 
     print(f"✅ Passing {len(filtered_watchlist)} stocks to GPT-4o: {filtered_watchlist}\n")
 
-    # If still nothing, skip trading today
     if not filtered_watchlist:
         print("🛑 No quality stocks found today — skipping trades.")
         return {
@@ -372,10 +369,10 @@ High volume ratio = strong institutional interest.
 Insider buying = very bullish signal.
 Analyst upgrades = momentum catalyst.
 Every stock shown has already passed a backtest quality filter:
-- Positive historical avg P&L of at least +0.5%
-- Calibrated trailing stop of at least 3.0% (meaning it trends cleanly, not choppy)
+- Positive historical avg P&L of at least +0.25%
+- Calibrated trailing stop of at least 2.5% (meaning it trends cleanly, not choppy)
 - No earnings within 5 days
-These are pre-vetted high quality candidates. Pick the best 3 based on today's
+These are pre-vetted quality candidates. Pick the best 3 based on today's
 technical setup. If fewer than 3 look genuinely good today, pick fewer —
 it is better to sit on cash than force a bad trade.
 The "Backtest-calibrated trailing stop" and avg P&L show historical performance.
@@ -412,7 +409,6 @@ TOP_PICKS:
             if len(top_picks) >= 3:
                 break
 
-    # No fallback to AAPL/MSFT/NVDA anymore — if nothing qualifies, sit on cash
     if not top_picks:
         print("🛑 GPT-4o found no quality picks today — sitting on cash.")
         return {
