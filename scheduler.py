@@ -50,6 +50,12 @@ GRACE_PERIOD_MINUTES      = 90
 MAX_POSITIONS             = 3
 MIN_BUYING_POWER          = 1000.0
 
+# Market hours (Central Time) — only run intraday checks during market hours
+MARKET_OPEN_HOUR   = 9
+MARKET_OPEN_MIN    = 35
+MARKET_CLOSE_HOUR  = 15
+MARKET_CLOSE_MIN   = 45
+
 # ---- OPTIONS FLAG ----
 ENABLE_OPTIONS = False
 if ENABLE_OPTIONS:
@@ -98,11 +104,24 @@ def is_in_grace_period(symbol):
     return elapsed < GRACE_PERIOD_MINUTES
 
 
+def is_market_hours():
+    """
+    Returns True if current time is within market hours (Central Time).
+    Checks between 9:35 AM and 3:45 PM Monday-Friday.
+    """
+    now = datetime.now()
+    # Skip weekends
+    if now.weekday() >= 5:
+        return False
+    # Check time window
+    market_open  = now.replace(hour=MARKET_OPEN_HOUR,  minute=MARKET_OPEN_MIN,  second=0)
+    market_close = now.replace(hour=MARKET_CLOSE_HOUR, minute=MARKET_CLOSE_MIN, second=0)
+    return market_open <= now <= market_close
+
+
 def sync_positions_from_alpaca():
     """
     Sync todays_symbols with whatever Alpaca actually shows as open.
-    This is the key fix — if the bot restarts mid-day or a new position
-    was bought but not tracked, this ensures we never miss monitoring it.
     Called at the start of every intraday and closing check.
     """
     global todays_symbols
@@ -110,13 +129,11 @@ def sync_positions_from_alpaca():
         open_positions = api.list_positions()
         open_symbols   = [p.symbol for p in open_positions]
 
-        # Add any symbols Alpaca has open that we're not tracking
         for symbol in open_symbols:
             if symbol not in todays_symbols:
                 print(f"🔄 Sync: adding {symbol} to monitoring (found in Alpaca positions)")
                 todays_symbols.append(symbol)
 
-        # Remove any symbols we're tracking that Alpaca no longer has open
         for symbol in list(todays_symbols):
             if symbol not in open_symbols:
                 print(f"🔄 Sync: removing {symbol} from monitoring (no longer in Alpaca)")
@@ -207,12 +224,10 @@ def run_morning_session():
     conviction_scores = research_result.get("conviction_scores", {})
     execute_trades(new_symbols, conviction_scores=conviction_scores)
 
-    # Record entry times for grace period tracking
     now = datetime.now()
     for symbol in new_symbols:
         entry_times[symbol] = now
 
-    # Options layer (dormant until ENABLE_OPTIONS = True)
     if ENABLE_OPTIONS and new_symbols:
         try:
             account         = api.get_account()
@@ -223,7 +238,6 @@ def run_morning_session():
         except Exception as e:
             print(f"⚠️ OPTIONS: Skipping — {e}")
 
-    # Sync with Alpaca after executing to catch any fills
     time.sleep(3)
     sync_positions_from_alpaca()
 
@@ -234,17 +248,24 @@ def run_morning_session():
     print("\n✅ MORNING SESSION COMPLETE!")
 
 
-def run_intraday_check(label):
-    global todays_symbols
-
-    # Always sync from Alpaca first — catches new buys, stops, and restarts
-    sync_positions_from_alpaca()
-
-    if not todays_symbols:
-        print(f"⚠️ No positions to monitor at {label}.")
+def run_intraday_check():
+    """
+    Runs every 5 minutes during market hours.
+    Silent if no positions open — only prints when actively monitoring.
+    """
+    # Only run during market hours
+    if not is_market_hours():
         return
 
-    print(f"\n🔄 INTRADAY CHECK - {label}")
+    # Sync from Alpaca
+    sync_positions_from_alpaca()
+
+    # Silent if nothing to monitor
+    if not todays_symbols:
+        return
+
+    now_str = datetime.now().strftime("%H:%M")
+    print(f"\n🔄 INTRADAY CHECK - {now_str}")
     print("=" * 50)
     for symbol in list(todays_symbols):
         check_position(symbol)
@@ -253,7 +274,6 @@ def run_intraday_check(label):
 def run_closing_check():
     global todays_symbols, high_water_marks, trailing_stops, entry_times
 
-    # Sync from Alpaca before closing check
     sync_positions_from_alpaca()
 
     if not todays_symbols:
@@ -330,24 +350,20 @@ def check_position(symbol):
 
 
 # ---- SCHEDULE ----
+# Morning session — fixed time
 for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
     getattr(schedule.every(), day).at("09:35").do(run_morning_session)
 
-intraday_times = [
-    "10:00", "10:30", "11:00", "11:30",
-    "12:00", "12:30", "13:00", "13:30",
-    "14:00", "14:30", "15:00", "15:30"
-]
-for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
-    for t in intraday_times:
-        getattr(schedule.every(), day).at(t).do(run_intraday_check, label=t)
-
+# Closing check — fixed time
 for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
     getattr(schedule.every(), day).at("15:45").do(run_closing_check)
 
+# Intraday checks — every 5 minutes, market hours gate inside the function
+schedule.every(5).minutes.do(run_intraday_check)
+
 print("⏰ SCHEDULER RUNNING")
 print("🌅 Morning session: 9:35 AM (calibration loaded from cache if fresh)")
-print("🔄 Intraday checks: every 30 min, 10:00 AM - 3:30 PM (syncs from Alpaca each time)")
+print("🔄 Intraday checks: every 5 min during market hours (silent when no positions)")
 print("🌆 Closing check: 3:45 PM (saves calibration cache for tomorrow)")
 print(f"🛡️ Stop Loss: -{STOP_LOSS_PCT}% (always active)")
 print(f"⏸️  Grace period: {GRACE_PERIOD_MINUTES} min after entry (trailing stop suppressed)")
@@ -357,4 +373,4 @@ print(f"📈 Options trading: {'ENABLED' if ENABLE_OPTIONS else 'DISABLED (flip 
 
 while True:
     schedule.run_pending()
-    time.sleep(60)
+    time.sleep(30)  # Check every 30 seconds so 5-min schedule fires accurately
