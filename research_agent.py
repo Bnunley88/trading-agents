@@ -19,12 +19,19 @@ ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 MIN_MARKET_CAP = 10_000_000_000
 
 # ---- QUALITY FILTERS ----
-# Minimum backtest avg P&L to pass — filters out barely-positive stocks
-MIN_CONVICTION_SCORE = 0.25   # lowered from 0.5 — was too aggressive
-# Minimum calibrated trailing stop % — filters out choppy stocks
-MIN_TRAILING_STOP    = 2.5    # lowered from 3.0 — was blocking good stocks like SOFI/AAL
-# Hard block earnings within this many days
+MIN_CONVICTION_SCORE = 0.25
+MIN_TRAILING_STOP    = 2.5
 EARNINGS_BLOCK_DAYS  = 5
+
+# ---- HIGH CONVICTION ANCHOR LIST ----
+# These are stocks that have historically performed well with this strategy.
+# Always included in the watchlist regardless of what Alpaca screener returns.
+# Updated based on backtest results — sorted by historical avg P&L.
+HIGH_CONVICTION_ANCHORS = [
+    "ARM", "HOOD", "ORCL", "GS", "JPM", "SNOW", "CAT", "DASH",
+    "UNH", "NOW", "SHOP", "MU", "JNJ", "SMCI", "AVGO", "LLY",
+    "META", "TSLA", "AAPL", "AMD"
+]
 
 FALLBACK_WATCHLIST = [
     "AAPL", "MSFT", "NVDA", "META", "TSLA", "AMZN", "GOOGL",
@@ -38,6 +45,14 @@ FALLBACK_WATCHLIST = [
 ]
 
 def get_dynamic_watchlist(top_n=20):
+    """
+    Builds a blended watchlist:
+    1. Alpaca most-actives screener (live market momentum)
+    2. HIGH_CONVICTION_ANCHORS (historically proven stocks)
+    Deduplicates and caps at top_n + len(anchors) so we always have
+    quality candidates even when the screener returns garbage.
+    """
+    screener_stocks = []
     try:
         url = "https://data.alpaca.markets/v1beta1/screener/stocks/most-actives"
         headers = {
@@ -49,11 +64,6 @@ def get_dynamic_watchlist(top_n=20):
         data     = response.json()
 
         candidates = data.get("most_actives", [])
-        if not candidates:
-            print("⚠️ Alpaca screener returned no results, using fallback watchlist.")
-            return FALLBACK_WATCHLIST
-
-        filtered = []
         for stock in candidates:
             symbol = stock.get("symbol", "")
             if not symbol or "." in symbol:
@@ -62,29 +72,35 @@ def get_dynamic_watchlist(top_n=20):
                 info       = yf.Ticker(symbol).info
                 market_cap = info.get("marketCap", 0) or 0
                 if market_cap >= MIN_MARKET_CAP:
-                    filtered.append(symbol)
-                if len(filtered) >= top_n:
+                    screener_stocks.append(symbol)
+                if len(screener_stocks) >= top_n:
                     break
             except:
                 continue
 
-        if len(filtered) < 3:
-            print("⚠️ Not enough candidates after filtering, using fallback watchlist.")
-            return FALLBACK_WATCHLIST
-
-        print(f"📋 Dynamic watchlist ({len(filtered)} stocks): {filtered}")
-        return filtered
+        if screener_stocks:
+            print(f"📋 Alpaca screener: {len(screener_stocks)} stocks — {screener_stocks}")
+        else:
+            print("⚠️ Alpaca screener returned no results.")
 
     except Exception as e:
-        print(f"⚠️ Alpaca screener failed ({e}), using fallback watchlist.")
+        print(f"⚠️ Alpaca screener failed ({e})")
+
+    # Blend: screener first, then anchors (deduped)
+    combined = list(screener_stocks)
+    for symbol in HIGH_CONVICTION_ANCHORS:
+        if symbol not in combined:
+            combined.append(symbol)
+
+    if not combined:
+        print("⚠️ Using full fallback watchlist.")
         return FALLBACK_WATCHLIST
+
+    print(f"📋 Blended watchlist ({len(combined)} stocks): {combined}")
+    return combined
 
 
 def check_earnings_block(symbol):
-    """
-    Returns (blocked: bool, days_until: int or None).
-    Hard blocks any stock with earnings within EARNINGS_BLOCK_DAYS.
-    """
     try:
         ticker    = yf.Ticker(symbol)
         calendar  = ticker.calendar
@@ -197,10 +213,6 @@ def get_finnhub_data(symbol):
 
 
 def calibrate_watchlist_parallel(watchlist):
-    """
-    Run calibrate_trailing_stop() on all tickers in parallel (8 workers).
-    Returns { symbol: (optimal_pct, report_string, best_avg_pnl) }
-    """
     print(f"\n📐 Calibrating trailing stops for {len(watchlist)} stocks in parallel...")
     calibration = {}
 
@@ -225,13 +237,13 @@ def calibrate_watchlist_parallel(watchlist):
 
 
 def research_stocks():
-    print("🔍 Building dynamic watchlist from Alpaca most-actives screener...")
+    print("🔍 Building blended watchlist (Alpaca screener + high conviction anchors)...")
     watchlist = get_dynamic_watchlist(top_n=20)
 
     calibration = calibrate_watchlist_parallel(watchlist)
 
-    # ---- FILTER 1: Hard block earnings within EARNINGS_BLOCK_DAYS ----
-    earnings_blocked = []
+    # ---- FILTER 1: Hard block earnings ----
+    earnings_blocked     = []
     post_earnings_filter = []
     for symbol in watchlist:
         blocked, days = check_earnings_block(symbol)
@@ -243,9 +255,7 @@ def research_stocks():
     if earnings_blocked:
         print(f"🚫 Earnings blocked: {', '.join(earnings_blocked)}")
 
-    # ---- FILTER 2: Remove negative P&L stocks ----
-    # ---- FILTER 3: Remove low conviction (< MIN_CONVICTION_SCORE) ----
-    # ---- FILTER 4: Remove choppy stocks (trailing stop < MIN_TRAILING_STOP) ----
+    # ---- FILTERS 2-4: Negative P&L, low conviction, choppy ----
     filtered_watchlist = []
     rejected           = []
     for symbol in post_earnings_filter:
@@ -255,15 +265,12 @@ def research_stocks():
         if pnl is None:
             filtered_watchlist.append(symbol)
             continue
-
         if pnl <= 0:
             rejected.append(f"{symbol} (negative P&L: {pnl:+.2f}%)")
             continue
-
         if pnl < MIN_CONVICTION_SCORE:
             rejected.append(f"{symbol} (low conviction: {pnl:+.2f}% < {MIN_CONVICTION_SCORE}%)")
             continue
-
         if optimal_stop < MIN_TRAILING_STOP:
             rejected.append(f"{symbol} (choppy: stop {optimal_stop}% < {MIN_TRAILING_STOP}% min)")
             continue
@@ -273,7 +280,7 @@ def research_stocks():
     if rejected:
         print(f"🚫 Filtered out: {', '.join(rejected)}")
 
-    # If filters are too aggressive and nothing passes, relax to positive P&L only
+    # Relax to positive P&L only if nothing passes
     if not filtered_watchlist:
         print("⚠️ All stocks filtered out — relaxing conviction threshold, keeping positive P&L only")
         for symbol in post_earnings_filter:
@@ -294,7 +301,6 @@ def research_stocks():
         }
 
     results = []
-
     for symbol in filtered_watchlist:
         try:
             ticker = yf.Ticker(symbol)
