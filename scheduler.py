@@ -12,6 +12,7 @@ from analyst_agent import analyze_recommendation
 from executor_agent import execute_trades
 from monitor_agent import monitor_position
 from exit_agent import exit_trade
+from options_agent import buy_call_option
 
 load_dotenv()
 
@@ -39,27 +40,34 @@ print("✅ Health server running on port 8080")
 # ---- STATE ----
 todays_symbols   = []
 high_water_marks = {}
-entry_times      = {}   # { symbol: datetime } — used for grace period tracking
+entry_times      = {}   # { symbol: datetime } — grace period tracking
 trailing_stops   = {}   # { symbol: float }    — per-stock calibrated trailing stop %
+consecutive_loss_days = 0   # tracks back-to-back losing days for cool-off logic
+daily_start_value     = 0.0 # portfolio value at start of day for daily loss limit
 
 # ---- CONSTANTS ----
-HARD_PROFIT_CEILING       = 5.0
+HARD_PROFIT_CEILING       = 3.0   # reduced from 5% — lock in profits faster
 STOP_LOSS_PCT             = 2.0
 TRAILING_STOP_PCT_DEFAULT = 2.0
 GRACE_PERIOD_MINUTES      = 90
 MAX_POSITIONS             = 3
 MIN_BUYING_POWER          = 1000.0
 
-# Market hours (Central Time) — only run intraday checks during market hours
+# ---- DAILY LOSS LIMIT ----
+# If portfolio drops more than this % from day's opening value, stop trading
+DAILY_LOSS_LIMIT_PCT      = 2.0   # pause trading if down 2% on the day
+# After this many consecutive losing days, reduce position sizing
+COOLOFF_LOSS_DAYS         = 3
+COOLOFF_RISK_MULTIPLIER   = 0.5   # cut position sizes in half during cool-off
+
+# ---- OPTIONS ----
+ENABLE_OPTIONS = True   # enabled for paper trading testing and tweaking
+
+# Market hours (Central Time)
 MARKET_OPEN_HOUR   = 9
 MARKET_OPEN_MIN    = 35
 MARKET_CLOSE_HOUR  = 15
 MARKET_CLOSE_MIN   = 45
-
-# ---- OPTIONS FLAG ----
-ENABLE_OPTIONS = False
-if ENABLE_OPTIONS:
-    from options_agent import buy_call_option
 
 # ---- CALIBRATION CACHE ----
 CACHE_FILE    = "calibration_cache.json"
@@ -105,25 +113,49 @@ def is_in_grace_period(symbol):
 
 
 def is_market_hours():
-    """
-    Returns True if current time is within market hours (Central Time).
-    Checks between 9:35 AM and 3:45 PM Monday-Friday.
-    """
     now = datetime.now()
-    # Skip weekends
     if now.weekday() >= 5:
         return False
-    # Check time window
     market_open  = now.replace(hour=MARKET_OPEN_HOUR,  minute=MARKET_OPEN_MIN,  second=0)
     market_close = now.replace(hour=MARKET_CLOSE_HOUR, minute=MARKET_CLOSE_MIN, second=0)
     return market_open <= now <= market_close
 
 
+def is_daily_loss_limit_hit():
+    """
+    Returns True if portfolio has dropped more than DAILY_LOSS_LIMIT_PCT
+    from the day's opening value. Pauses new trades for the rest of the session.
+    """
+    if daily_start_value <= 0:
+        return False
+    try:
+        account       = api.get_account()
+        current_value = float(account.portfolio_value)
+        daily_pct     = ((current_value - daily_start_value) / daily_start_value) * 100
+        if daily_pct <= -DAILY_LOSS_LIMIT_PCT:
+            print(f"🛑 DAILY LOSS LIMIT HIT: portfolio down {daily_pct:.2f}% today "
+                  f"(limit: -{DAILY_LOSS_LIMIT_PCT}%) — pausing new trades.")
+            return True
+        return False
+    except Exception as e:
+        print(f"⚠️ Could not check daily loss limit: {e}")
+        return False
+
+
+def get_risk_multiplier():
+    """
+    Returns a risk multiplier based on consecutive losing days.
+    Normal: 1.0 (full position sizes)
+    Cool-off: 0.5 (half position sizes after COOLOFF_LOSS_DAYS consecutive losses)
+    """
+    if consecutive_loss_days >= COOLOFF_LOSS_DAYS:
+        print(f"⚠️ COOL-OFF ACTIVE: {consecutive_loss_days} consecutive losing days — "
+              f"position sizes reduced to {COOLOFF_RISK_MULTIPLIER * 100:.0f}%")
+        return COOLOFF_RISK_MULTIPLIER
+    return 1.0
+
+
 def sync_positions_from_alpaca():
-    """
-    Sync todays_symbols with whatever Alpaca actually shows as open.
-    Called at the start of every intraday and closing check.
-    """
     global todays_symbols
     try:
         open_positions = api.list_positions()
@@ -147,13 +179,28 @@ def sync_positions_from_alpaca():
 
 def run_morning_session():
     global todays_symbols, high_water_marks, trailing_stops, entry_times
+    global daily_start_value, consecutive_loss_days
+
     print("\n🌅 MORNING SESSION - 9:35 AM")
     print("=" * 50)
+
+    # Record portfolio value at start of day for daily loss limit tracking
+    try:
+        account           = api.get_account()
+        daily_start_value = float(account.portfolio_value)
+        print(f"📊 Day opening portfolio value: ${daily_start_value:,.2f}")
+    except Exception as e:
+        print(f"⚠️ Could not record daily start value: {e}")
+
+    # Log cool-off status
+    risk_mult = get_risk_multiplier()
+    if consecutive_loss_days > 0:
+        print(f"📉 Consecutive losing days: {consecutive_loss_days} "
+              f"({'COOL-OFF ACTIVE' if consecutive_loss_days >= COOLOFF_LOSS_DAYS else 'watching'})")
 
     try:
         existing_positions = api.list_positions()
         existing_symbols   = [p.symbol for p in existing_positions]
-        account            = api.get_account()
         buying_power       = float(account.buying_power)
 
         print(f"💼 Open positions: {existing_symbols}")
@@ -201,6 +248,14 @@ def run_morning_session():
         print("\n✅ MORNING SESSION COMPLETE (no new buys — no quality picks today)")
         return
 
+    # Check daily loss limit before buying anything
+    if is_daily_loss_limit_hit():
+        todays_symbols = existing_symbols
+        for symbol in todays_symbols:
+            check_position(symbol)
+        print("\n✅ MORNING SESSION COMPLETE (no new buys — daily loss limit hit)")
+        return
+
     slots_available = MAX_POSITIONS - len(existing_symbols)
     new_symbols     = [s for s in top_symbols if s not in existing_symbols][:slots_available]
 
@@ -222,12 +277,14 @@ def run_morning_session():
     print(f"Already holding: {existing_symbols}")
     print(f"New trades today: {new_symbols}")
     conviction_scores = research_result.get("conviction_scores", {})
-    execute_trades(new_symbols, conviction_scores=conviction_scores)
+    execute_trades(new_symbols, conviction_scores=conviction_scores,
+                   risk_multiplier=risk_mult)
 
     now = datetime.now()
     for symbol in new_symbols:
         entry_times[symbol] = now
 
+    # Options layer
     if ENABLE_OPTIONS and new_symbols:
         try:
             account         = api.get_account()
@@ -249,18 +306,15 @@ def run_morning_session():
 
 
 def run_intraday_check():
-    """
-    Runs every 5 minutes during market hours.
-    Silent if no positions open — only prints when actively monitoring.
-    """
-    # Only run during market hours
     if not is_market_hours():
         return
 
-    # Sync from Alpaca
+    # Check daily loss limit — if hit, exit existing positions but don't buy more
+    if todays_symbols and is_daily_loss_limit_hit():
+        print("🛑 Daily loss limit active — monitoring only, no new buys.")
+
     sync_positions_from_alpaca()
 
-    # Silent if nothing to monitor
     if not todays_symbols:
         return
 
@@ -273,11 +327,14 @@ def run_intraday_check():
 
 def run_closing_check():
     global todays_symbols, high_water_marks, trailing_stops, entry_times
+    global consecutive_loss_days, daily_start_value
 
     sync_positions_from_alpaca()
 
-    if not todays_symbols:
+    if not todays_symbols and daily_start_value <= 0:
         print("⚠️ No positions to monitor at close.")
+        # Still update consecutive loss tracking
+        _update_loss_streak()
         return
 
     print("\n🌆 CLOSING CHECK - 3:45 PM")
@@ -286,12 +343,45 @@ def run_closing_check():
     for symbol in list(todays_symbols):
         check_position(symbol)
 
+    # Update consecutive loss streak
+    _update_loss_streak()
+
     if trailing_stops:
         save_calibration_cache(trailing_stops)
 
     todays_symbols   = []
     high_water_marks = {}
     entry_times      = {}
+
+
+def _update_loss_streak():
+    """
+    Compares today's closing portfolio value to the day's opening value.
+    Updates consecutive_loss_days for cool-off logic.
+    """
+    global consecutive_loss_days, daily_start_value
+    if daily_start_value <= 0:
+        return
+    try:
+        account       = api.get_account()
+        closing_value = float(account.portfolio_value)
+        daily_pnl_pct = ((closing_value - daily_start_value) / daily_start_value) * 100
+
+        if daily_pnl_pct < 0:
+            consecutive_loss_days += 1
+            print(f"📉 Day closed down {daily_pnl_pct:.2f}% — "
+                  f"consecutive losing days: {consecutive_loss_days}")
+            if consecutive_loss_days >= COOLOFF_LOSS_DAYS:
+                print(f"⚠️ {COOLOFF_LOSS_DAYS}+ consecutive losing days — "
+                      f"cool-off active tomorrow (position sizes at 50%)")
+        else:
+            if consecutive_loss_days > 0:
+                print(f"✅ Day closed up {daily_pnl_pct:.2f}% — "
+                      f"resetting consecutive loss streak (was {consecutive_loss_days})")
+            consecutive_loss_days = 0
+
+    except Exception as e:
+        print(f"⚠️ Could not update loss streak: {e}")
 
 
 def check_position(symbol):
@@ -350,15 +440,12 @@ def check_position(symbol):
 
 
 # ---- SCHEDULE ----
-# Morning session — fixed time
 for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
     getattr(schedule.every(), day).at("09:35").do(run_morning_session)
 
-# Closing check — fixed time
 for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
     getattr(schedule.every(), day).at("15:45").do(run_closing_check)
 
-# Intraday checks — every 5 minutes, market hours gate inside the function
 schedule.every(5).minutes.do(run_intraday_check)
 
 print("⏰ SCHEDULER RUNNING")
@@ -368,9 +455,11 @@ print("🌆 Closing check: 3:45 PM (saves calibration cache for tomorrow)")
 print(f"🛡️ Stop Loss: -{STOP_LOSS_PCT}% (always active)")
 print(f"⏸️  Grace period: {GRACE_PERIOD_MINUTES} min after entry (trailing stop suppressed)")
 print(f"📉 Trailing Stop: per-stock calibrated (default fallback: {TRAILING_STOP_PCT_DEFAULT}%)")
-print(f"💰 Hard Profit Ceiling: +{HARD_PROFIT_CEILING}%")
-print(f"📈 Options trading: {'ENABLED' if ENABLE_OPTIONS else 'DISABLED (flip ENABLE_OPTIONS to True when ready)'}")
+print(f"💰 Hard Profit Ceiling: +{HARD_PROFIT_CEILING}% (reduced from 5%)")
+print(f"🛑 Daily loss limit: -{DAILY_LOSS_LIMIT_PCT}% (pauses new trades if hit)")
+print(f"❄️  Cool-off: after {COOLOFF_LOSS_DAYS} consecutive losing days (position sizes at 50%)")
+print(f"📈 Options trading: {'ENABLED' if ENABLE_OPTIONS else 'DISABLED'}")
 
 while True:
     schedule.run_pending()
-    time.sleep(30)  # Check every 30 seconds so 5-min schedule fires accurately
+    time.sleep(30)
