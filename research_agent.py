@@ -23,14 +23,27 @@ MIN_CONVICTION_SCORE = 0.25
 MIN_TRAILING_STOP    = 2.5
 EARNINGS_BLOCK_DAYS  = 5
 
+# ---- DOWNTREND FILTER ----
+# Block stocks where price is this % below their 30-day high
+# Catches falling knives like IREN that look oversold but are in freefall
+DOWNTREND_BLOCK_PCT  = 15.0
+
 # ---- HIGH CONVICTION ANCHOR LIST ----
-# These are stocks that have historically performed well with this strategy.
-# Always included in the watchlist regardless of what Alpaca screener returns.
-# Updated based on backtest results — sorted by historical avg P&L.
+# Trimmed to top 12 highest conviction names based on backtest results
+# Sorted by historical avg P&L
 HIGH_CONVICTION_ANCHORS = [
-    "ARM", "HOOD", "ORCL", "GS", "JPM", "SNOW", "CAT", "DASH",
-    "UNH", "NOW", "SHOP", "MU", "JNJ", "SMCI", "AVGO", "LLY",
-    "META", "TSLA", "AAPL", "AMD"
+    "ARM",   # +2.43%
+    "HOOD",  # +2.43%
+    "DASH",  # +2.73%
+    "SHOP",  # +2.34%
+    "JPM",   # +2.18%
+    "UNH",   # +1.95%
+    "GS",    # +1.54%
+    "SNOW",  # +1.52%
+    "CAT",   # +1.44%
+    "META",  # +1.73%
+    "JNJ",   # +1.45%
+    "NOW",   # +1.02%
 ]
 
 FALLBACK_WATCHLIST = [
@@ -48,9 +61,7 @@ def get_dynamic_watchlist(top_n=20):
     """
     Builds a blended watchlist:
     1. Alpaca most-actives screener (live market momentum)
-    2. HIGH_CONVICTION_ANCHORS (historically proven stocks)
-    Deduplicates and caps at top_n + len(anchors) so we always have
-    quality candidates even when the screener returns garbage.
+    2. HIGH_CONVICTION_ANCHORS (trimmed to top 12 proven stocks)
     """
     screener_stocks = []
     try:
@@ -86,7 +97,6 @@ def get_dynamic_watchlist(top_n=20):
     except Exception as e:
         print(f"⚠️ Alpaca screener failed ({e})")
 
-    # Blend: screener first, then anchors (deduped)
     combined = list(screener_stocks)
     for symbol in HIGH_CONVICTION_ANCHORS:
         if symbol not in combined:
@@ -115,6 +125,46 @@ def check_earnings_block(symbol):
         return False, days_until
     except:
         return False, None
+
+
+def check_downtrend(symbol):
+    """
+    Returns (blocked: bool, pct_below_high: float)
+    Blocks stocks that are more than DOWNTREND_BLOCK_PCT% below their 30-day high.
+    Catches falling knives that look oversold on RSI but are in a clear downtrend.
+    A stock can be RSI=20 and still be a falling knife — this filter catches that.
+    """
+    try:
+        hist = yf.Ticker(symbol).history(period="30d")
+        if hist.empty or len(hist) < 5:
+            return False, 0.0
+        high_30d     = hist["Close"].max()
+        current      = hist["Close"].iloc[-1]
+        pct_below    = ((high_30d - current) / high_30d) * 100
+        if pct_below >= DOWNTREND_BLOCK_PCT:
+            return True, round(pct_below, 1)
+        return False, round(pct_below, 1)
+    except:
+        return False, 0.0
+
+
+def get_vwap(hist):
+    """
+    Calculates VWAP (Volume Weighted Average Price) for the last 5 days
+    of intraday-equivalent data using daily OHLC.
+    Returns (vwap, pct_above_vwap) where positive = bullish, negative = bearish.
+    """
+    try:
+        if hist.empty or len(hist) < 5:
+            return "N/A", "N/A"
+        recent       = hist.tail(5)
+        typical_price = (recent["High"] + recent["Low"] + recent["Close"]) / 3
+        vwap         = (typical_price * recent["Volume"]).sum() / recent["Volume"].sum()
+        current      = hist["Close"].iloc[-1]
+        pct_vs_vwap  = round(((current - vwap) / vwap) * 100, 2)
+        return round(vwap, 2), pct_vs_vwap
+    except:
+        return "N/A", "N/A"
 
 
 def get_news_sentiment(symbol, company_name):
@@ -237,7 +287,7 @@ def calibrate_watchlist_parallel(watchlist):
 
 
 def research_stocks():
-    print("🔍 Building blended watchlist (Alpaca screener + high conviction anchors)...")
+    print("🔍 Building blended watchlist (Alpaca screener + top 12 conviction anchors)...")
     watchlist = get_dynamic_watchlist(top_n=20)
 
     calibration = calibrate_watchlist_parallel(watchlist)
@@ -255,10 +305,23 @@ def research_stocks():
     if earnings_blocked:
         print(f"🚫 Earnings blocked: {', '.join(earnings_blocked)}")
 
-    # ---- FILTERS 2-4: Negative P&L, low conviction, choppy ----
+    # ---- FILTER 2: Downtrend filter (falling knife protection) ----
+    downtrend_blocked      = []
+    post_downtrend_filter  = []
+    for symbol in post_earnings_filter:
+        blocked, pct_below = check_downtrend(symbol)
+        if blocked:
+            downtrend_blocked.append(f"{symbol} ({pct_below}% below 30d high)")
+        else:
+            post_downtrend_filter.append(symbol)
+
+    if downtrend_blocked:
+        print(f"🚫 Downtrend blocked: {', '.join(downtrend_blocked)}")
+
+    # ---- FILTERS 3-5: Negative P&L, low conviction, choppy ----
     filtered_watchlist = []
     rejected           = []
-    for symbol in post_earnings_filter:
+    for symbol in post_downtrend_filter:
         optimal_stop, _, best_avg_pnl = calibration.get(symbol, (TRAILING_STOP_PCT, "", None))
         pnl = float(best_avg_pnl) if best_avg_pnl is not None else None
 
@@ -283,7 +346,7 @@ def research_stocks():
     # Relax to positive P&L only if nothing passes
     if not filtered_watchlist:
         print("⚠️ All stocks filtered out — relaxing conviction threshold, keeping positive P&L only")
-        for symbol in post_earnings_filter:
+        for symbol in post_downtrend_filter:
             _, _, best_avg_pnl = calibration.get(symbol, (TRAILING_STOP_PCT, "", None))
             pnl = float(best_avg_pnl) if best_avg_pnl is not None else None
             if pnl is None or pnl > 0:
@@ -334,6 +397,14 @@ def research_stocks():
             if volume != "N/A" and avg_volume and avg_volume > 0:
                 volume_ratio = round(volume / avg_volume, 2)
 
+            # VWAP calculation
+            vwap, pct_vs_vwap = get_vwap(hist)
+            if pct_vs_vwap != "N/A":
+                vwap_label = f"VWAP=${vwap} | Price vs VWAP: {pct_vs_vwap:+.2f}% " \
+                             f"({'above — bullish' if pct_vs_vwap > 0 else 'below — bearish'})"
+            else:
+                vwap_label = "VWAP: unavailable"
+
             news     = get_news_sentiment(symbol, name)
             earnings = get_earnings_info(ticker)
             insider  = get_insider_activity(ticker)
@@ -354,6 +425,7 @@ def research_stocks():
                 f"  Analyst Rating: {analyst}\n"
                 f"  News: {news}\n"
                 f"  Cross-check: {finnhub}\n"
+                f"  {vwap_label}\n"
                 f"  Backtest-calibrated trailing stop: {optimal_stop}% "
                 f"(avg P&L: {pnl_display}, 90-min grace period active after entry)"
             )
@@ -374,12 +446,17 @@ RSI below 30 = oversold (potential buy). RSI above 70 = overbought (avoid).
 High volume ratio = strong institutional interest.
 Insider buying = very bullish signal.
 Analyst upgrades = momentum catalyst.
-Every stock shown has already passed a backtest quality filter:
+Every stock shown has already passed multiple quality filters:
 - Positive historical avg P&L of at least +0.25%
-- Calibrated trailing stop of at least 2.5% (meaning it trends cleanly, not choppy)
+- Calibrated trailing stop of at least 2.5% (trending cleanly, not choppy)
 - No earnings within 5 days
-These are pre-vetted quality candidates. Pick the best 3 based on today's
-technical setup. If fewer than 3 look genuinely good today, pick fewer —
+- Not more than 15% below its 30-day high (no falling knives)
+These are pre-vetted quality candidates. Pick the best 3 based on today's setup.
+VWAP (Volume Weighted Average Price) is a key signal:
+- Price above VWAP = bullish, institutional buying pressure
+- Price below VWAP = bearish, selling pressure
+- Prefer stocks trading above their VWAP with positive momentum
+If fewer than 3 look genuinely good today, pick fewer —
 it is better to sit on cash than force a bad trade.
 The "Backtest-calibrated trailing stop" and avg P&L show historical performance.
 Higher avg P&L = stronger historical edge. Higher trailing stop = cleaner trend.
@@ -408,7 +485,7 @@ TOP_PICKS:
             line    = line.replace("**", "").replace("*", "")
             matches = re.findall(r'\b[A-Z]{2,5}\b', line)
             for match in matches:
-                if match not in ("TOP", "PICKS", "RSI", "CEO", "ETF", "NYSE", "NA"):
+                if match not in ("TOP", "PICKS", "RSI", "CEO", "ETF", "NYSE", "NA", "VWAP"):
                     if match not in top_picks:
                         top_picks.append(match)
                         break
