@@ -17,60 +17,47 @@ MIN_RISK_PCT    = 0.005  # floor: never allocate less than 0.5% to any single pi
 MAX_RISK_PCT    = 0.035  # ceiling: never allocate more than 3.5% to any single pick
 
 
-def compute_conviction_weights(symbols, conviction_scores):
-    """
-    Given a list of symbols and their backtest avg P&L scores, return a
-    dict of { symbol: risk_pct } that sums to TOTAL_RISK_PCT.
+def compute_conviction_weights(symbols, conviction_scores, risk_multiplier=1.0):
+    effective_total = TOTAL_RISK_PCT * risk_multiplier
+    effective_min   = MIN_RISK_PCT   * risk_multiplier
+    effective_max   = MAX_RISK_PCT   * risk_multiplier
 
-    Weighting logic:
-      - Scores are shifted so the minimum is 0 (no negatives in the weight calc)
-      - Each symbol's weight = its shifted score / sum of all shifted scores
-      - Weight is then scaled to TOTAL_RISK_PCT and clamped to [MIN, MAX]
-      - Any remainder after clamping is distributed evenly across unclamped symbols
-
-    Falls back to equal weighting if scores are missing or all identical.
-    """
     if not conviction_scores or len(symbols) == 0:
-        equal = TOTAL_RISK_PCT / len(symbols)
+        equal = effective_total / len(symbols)
         return {s: equal for s in symbols}
 
     scores = [conviction_scores.get(s, 0.0) for s in symbols]
 
-    # If all scores are identical or zero, equal weight
     if len(set(scores)) == 1 or sum(s for s in scores if s > 0) == 0:
-        equal = TOTAL_RISK_PCT / len(symbols)
+        equal = effective_total / len(symbols)
         return {s: equal for s in symbols}
 
-    # Shift so minimum score becomes 0, preserving relative differences
     min_score = min(scores)
     shifted   = [s - min_score for s in scores]
     total     = sum(shifted)
 
     if total == 0:
-        equal = TOTAL_RISK_PCT / len(symbols)
+        equal = effective_total / len(symbols)
         return {s: equal for s in symbols}
 
-    # Raw weighted allocations
-    raw = {s: (shifted[i] / total) * TOTAL_RISK_PCT
+    raw = {s: (shifted[i] / total) * effective_total
            for i, s in enumerate(symbols)}
 
-    # Clamp to [MIN, MAX]
     clamped   = {}
     remainder = 0.0
     free      = []
 
     for s, alloc in raw.items():
-        if alloc < MIN_RISK_PCT:
-            clamped[s] = MIN_RISK_PCT
-            remainder += MIN_RISK_PCT - alloc  # deficit pulled from remainder pool
-        elif alloc > MAX_RISK_PCT:
-            clamped[s] = MAX_RISK_PCT
-            remainder += alloc - MAX_RISK_PCT  # surplus goes back to remainder pool
+        if alloc < effective_min:
+            clamped[s] = effective_min
+            remainder -= effective_min - alloc
+        elif alloc > effective_max:
+            clamped[s] = effective_max
+            remainder += alloc - effective_max
         else:
             clamped[s] = alloc
             free.append(s)
 
-    # Distribute remainder across unclamped symbols proportionally
     if remainder != 0 and free:
         free_total = sum(clamped[s] for s in free)
         for s in free:
@@ -83,10 +70,6 @@ def compute_conviction_weights(symbols, conviction_scores):
 
 
 def get_position_size(symbol, risk_pct):
-    """
-    Convert a risk % allocation into a share count for the given symbol.
-    Always uses portfolio_value (not buying_power) for correct sizing.
-    """
     try:
         account         = api.get_account()
         portfolio_value = float(account.portfolio_value)
@@ -108,12 +91,6 @@ def get_position_size(symbol, risk_pct):
 
 
 def execute_trade(symbol, shares=None, risk_pct=None):
-    """
-    Place a market buy order for symbol.
-    If shares is provided, use it directly.
-    If risk_pct is provided, calculate shares from portfolio value.
-    Falls back to flat 2% if neither is provided.
-    """
     try:
         if shares is None:
             rp     = risk_pct if risk_pct is not None else 0.02
@@ -137,25 +114,17 @@ def execute_trade(symbol, shares=None, risk_pct=None):
         return None
 
 
-def execute_trades(symbols, conviction_scores=None):
-    """
-    Main entry point called by scheduler.py.
-
-    symbols           — list of tickers to buy (already filtered, max 3)
-    conviction_scores — dict of { symbol: best_avg_pnl } from backtest calibration
-                        If None or missing, falls back to equal 2% per position.
-
-    Prints the full allocation table before placing any orders so you can
-    see exactly how capital is being split in the Railway logs.
-    """
+def execute_trades(symbols, conviction_scores=None, risk_multiplier=1.0):
     if not symbols:
         print("EXECUTOR AGENT: No symbols to trade.")
         return
 
-    weights = compute_conviction_weights(symbols, conviction_scores or {})
+    weights = compute_conviction_weights(symbols, conviction_scores or {},
+                                         risk_multiplier=risk_multiplier)
 
-    print("\n📊 CONVICTION-WEIGHTED ALLOCATION:")
-    print(f"   Total risk budget: {TOTAL_RISK_PCT*100:.1f}% of portfolio")
+    cooloff_label = f" [COOL-OFF: {risk_multiplier*100:.0f}% sizing]" if risk_multiplier < 1.0 else ""
+    print(f"\n📊 CONVICTION-WEIGHTED ALLOCATION{cooloff_label}:")
+    print(f"   Total risk budget: {TOTAL_RISK_PCT * risk_multiplier * 100:.1f}% of portfolio")
     for s in symbols:
         score = conviction_scores.get(s, 0.0) if conviction_scores else 0.0
         print(f"   {s}: {weights[s]*100:.2f}% allocation  "
@@ -167,11 +136,17 @@ def execute_trades(symbols, conviction_scores=None):
 
 
 if __name__ == "__main__":
-    # Test with the picks from tonight — shows allocation without placing orders
-    # (swap in real conviction scores from your backtest output)
     test_symbols = ["CRM", "SNOW", "SHOP"]
     test_scores  = {"CRM": 0.12, "SNOW": 1.56, "SHOP": 1.12}
-    weights      = compute_conviction_weights(test_symbols, test_scores)
-    print("Conviction-weighted allocation test:")
+
+    print("Normal sizing (risk_multiplier=1.0):")
+    weights = compute_conviction_weights(test_symbols, test_scores, risk_multiplier=1.0)
     for s, w in weights.items():
         print(f"  {s}: {w*100:.2f}%  (score: {test_scores[s]:+.2f}%)")
+    print(f"  Total: {sum(weights.values())*100:.2f}%")
+
+    print("\nCool-off sizing (risk_multiplier=0.5):")
+    weights = compute_conviction_weights(test_symbols, test_scores, risk_multiplier=0.5)
+    for s, w in weights.items():
+        print(f"  {s}: {w*100:.2f}%  (score: {test_scores[s]:+.2f}%)")
+    print(f"  Total: {sum(weights.values())*100:.2f}%")
