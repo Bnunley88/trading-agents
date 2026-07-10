@@ -1,20 +1,19 @@
 """
 Standalone backtester + trailing stop calibrator.
 
-THREE MODES:
+MODES:
   1. Standalone backtest — run directly:
          python3 backtest.py
-     Tests fixed and ATR-based trailing stops, prints summary and walk-forward results.
+     Tests fixed and ATR-based trailing stops, prints summary, walk-forward
+     calibration, Sharpe ratios, and Monte Carlo simulation results.
 
   2. Calibration mode — import and call:
          from backtest import calibrate_trailing_stop
          optimal_pct, report, best_avg_pnl = calibrate_trailing_stop("TSLA")
-     Tests multiple trailing stop values and returns the optimal % for that ticker.
-     Now uses walk-forward validation to avoid overfitting.
+     Uses walk-forward validation + Sharpe ratio to pick the optimal stop.
+     More robust than raw avg P&L alone.
 
-  3. ATR mode — trailing stop sized dynamically by Average True Range:
-     Instead of a fixed %, the stop is set at entry_price - (ATR * ATR_MULTIPLIER).
-     Widens automatically on volatile days, tightens on calm days.
+  3. ATR mode — trailing stop sized dynamically by Average True Range.
 
 Does NOT import anything from the live bot files and cannot place trades.
 """
@@ -25,39 +24,66 @@ import numpy as np
 
 # ---- CONFIG ----
 TRAILING_STOP_PCT      = 2.0
-HARD_PROFIT_CEILING    = 3.0   # updated to match scheduler's new 3% ceiling
+HARD_PROFIT_CEILING    = 3.0
 STOP_LOSS_PCT          = 2.0
-CHECK_INTERVAL_MINUTES = 5     # updated to match scheduler's 5-min checks
+CHECK_INTERVAL_MINUTES = 5
 GRACE_PERIOD_MINUTES   = 90
 
 TICKERS   = ["AAPL", "MSFT", "NVDA", "META", "TSLA", "AMZN", "JNJ", "XOM", "COST"]
 DAYS_BACK = 30
 
 # ---- ATR CONFIG ----
-ATR_PERIOD     = 14    # standard ATR period
-ATR_MULTIPLIER = 1.5   # trailing stop = ATR * multiplier (higher = wider stop)
+ATR_PERIOD     = 14
+ATR_MULTIPLIER = 1.5
 
 # ---- CALIBRATION CONFIG ----
 CALIBRATION_CANDIDATES     = [2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0]
 MIN_TRADES_FOR_CALIBRATION = 4
 
 # ---- WALK-FORWARD CONFIG ----
-# Split the 30-day window: train on first N days, validate on remaining days
-# This prevents overfitting to a single period
-WALK_FORWARD_TRAIN_DAYS    = 20   # train on first 20 days
-WALK_FORWARD_VALIDATE_DAYS = 10   # validate on last 10 days
+WALK_FORWARD_TRAIN_DAYS    = 20
+WALK_FORWARD_VALIDATE_DAYS = 10
+
+# ---- SHARPE RATIO CONFIG ----
+# Risk-free rate (annualized) — approx current T-bill rate
+RISK_FREE_RATE_ANNUAL = 0.05
+# Convert to per-trade rate assuming ~252 trading days, ~2 trades per day
+RISK_FREE_RATE_PER_TRADE = RISK_FREE_RATE_ANNUAL / (252 * 2)
+# Minimum Sharpe ratio to prefer a candidate over another with higher raw P&L
+# A Sharpe > 0.5 means the strategy has meaningful risk-adjusted returns
+MIN_SHARPE_FOR_PREFERENCE = 0.3
+
+# ---- MONTE CARLO CONFIG ----
+MONTE_CARLO_SIMULATIONS = 500    # number of random trade sequences to simulate
+MONTE_CARLO_SEQUENCE_LEN = 20   # trades per simulated sequence
+
+
+def compute_sharpe(pnl_series, risk_free_per_trade=RISK_FREE_RATE_PER_TRADE):
+    """
+    Computes Sharpe ratio for a series of trade P&L percentages.
+    Sharpe = (avg_return - risk_free) / std_return
+    Higher = better risk-adjusted returns.
+    >1.0 = excellent, >0.5 = good, >0.3 = acceptable, <0 = worse than cash
+    Returns None if insufficient data.
+    """
+    try:
+        if len(pnl_series) < 4:
+            return None
+        returns = pd.Series(pnl_series)
+        avg     = returns.mean()
+        std     = returns.std()
+        if std == 0:
+            return None
+        sharpe = (avg - risk_free_per_trade) / std
+        return round(sharpe, 3)
+    except Exception:
+        return None
 
 
 def compute_atr(hist, period=ATR_PERIOD):
-    """
-    Computes Average True Range from daily OHLC data.
-    ATR = average of True Range over `period` days.
-    True Range = max(High-Low, abs(High-PrevClose), abs(Low-PrevClose))
-    Returns a Series of ATR values aligned with hist index.
-    """
     try:
-        high      = hist["High"]
-        low       = hist["Low"]
+        high       = hist["High"]
+        low        = hist["Low"]
         prev_close = hist["Close"].shift(1)
 
         tr = pd.concat([
@@ -73,18 +99,11 @@ def compute_atr(hist, period=ATR_PERIOD):
 
 
 def get_atr_trailing_stop_pct(entry_price, atr_value, multiplier=ATR_MULTIPLIER):
-    """
-    Converts an ATR value into a trailing stop percentage.
-    stop_price = entry_price - (atr * multiplier)
-    stop_pct   = (entry_price - stop_price) / entry_price * 100
-    Falls back to TRAILING_STOP_PCT if ATR is unavailable.
-    """
     try:
         if pd.isna(atr_value) or atr_value <= 0 or entry_price <= 0:
             return TRAILING_STOP_PCT
         stop_price = entry_price - (atr_value * multiplier)
         stop_pct   = ((entry_price - stop_price) / entry_price) * 100
-        # Clamp between 1% and 8% to prevent extreme values
         return round(max(1.0, min(8.0, stop_pct)), 2)
     except Exception:
         return TRAILING_STOP_PCT
@@ -97,24 +116,17 @@ def simulate_trade(symbol, full_df, entry_price, entry_time,
                    grace_period_minutes=None,
                    use_atr=False,
                    atr_series=None):
-    """
-    Replays one simulated trade through the exit logic.
-
-    use_atr    — if True, trailing stop is dynamic (ATR-based) rather than fixed %
-    atr_series — pre-computed ATR series for the symbol (required if use_atr=True)
-    """
     if trailing_stop_pct    is None: trailing_stop_pct    = TRAILING_STOP_PCT
     if hard_ceiling         is None: hard_ceiling         = HARD_PROFIT_CEILING
     if stop_loss_pct        is None: stop_loss_pct        = STOP_LOSS_PCT
     if grace_period_minutes is None: grace_period_minutes = GRACE_PERIOD_MINUTES
 
-    # ATR-based trailing stop: compute at entry
     if use_atr and atr_series is not None:
         try:
             atr_at_entry      = atr_series.asof(entry_time)
             trailing_stop_pct = get_atr_trailing_stop_pct(entry_price, atr_at_entry)
         except Exception:
-            pass  # fall back to fixed %
+            pass
 
     high_water_mark = entry_price
     checks  = full_df[full_df.index > entry_time]
@@ -223,17 +235,72 @@ def _run_ticker(symbol, hist, trailing_stop_pct, grace_period_minutes=None,
     return results
 
 
+def run_monte_carlo(pnl_list, n_simulations=MONTE_CARLO_SIMULATIONS,
+                    sequence_len=MONTE_CARLO_SEQUENCE_LEN):
+    """
+    Monte Carlo simulation — stress tests the strategy beyond a single historical path.
+
+    Takes the actual trade P&L results and randomly shuffles them into
+    n_simulations different sequences of sequence_len trades each.
+    This shows the range of possible outcomes if trades had occurred in a
+    different order, revealing:
+    - Best case / worst case equity curves
+    - Probability of drawdown exceeding X%
+    - How much luck vs skill is in the backtest results
+
+    Returns dict with simulation statistics.
+    """
+    if len(pnl_list) < sequence_len:
+        return None
+
+    pnl_array    = np.array(pnl_list)
+    final_returns = []
+    max_drawdowns = []
+    sharpe_scores = []
+
+    for _ in range(n_simulations):
+        # Random sample with replacement from actual trade results
+        sample      = np.random.choice(pnl_array, size=sequence_len, replace=True)
+        cum_return  = sample.sum()
+        final_returns.append(cum_return)
+
+        # Calculate max drawdown for this sequence
+        equity = np.cumsum(sample)
+        peak   = np.maximum.accumulate(equity)
+        dd     = equity - peak
+        max_drawdowns.append(dd.min())
+
+        # Sharpe for this sequence
+        if sample.std() > 0:
+            sharpe_scores.append((sample.mean() - RISK_FREE_RATE_PER_TRADE) / sample.std())
+
+    final_returns = np.array(final_returns)
+    max_drawdowns = np.array(max_drawdowns)
+
+    return {
+        "n_simulations":      n_simulations,
+        "sequence_len":       sequence_len,
+        "median_return":      round(np.median(final_returns), 2),
+        "mean_return":        round(np.mean(final_returns), 2),
+        "best_case":          round(np.percentile(final_returns, 95), 2),
+        "worst_case":         round(np.percentile(final_returns, 5), 2),
+        "pct_profitable":     round((final_returns > 0).mean() * 100, 1),
+        "avg_max_drawdown":   round(np.mean(max_drawdowns), 2),
+        "worst_drawdown":     round(np.min(max_drawdowns), 2),
+        "avg_sharpe":         round(np.mean(sharpe_scores), 3) if sharpe_scores else None,
+    }
+
+
 def calibrate_trailing_stop(symbol, days_back=DAYS_BACK):
     """
     Called by research_agent.py for each candidate stock (in parallel).
 
-    Uses WALK-FORWARD validation:
-    - Train: finds best trailing stop % on first WALK_FORWARD_TRAIN_DAYS days
-    - Validate: confirms performance on last WALK_FORWARD_VALIDATE_DAYS days
-    - Returns the validated best % (more robust, less overfitting)
-
-    Also computes ATR-based trailing stop as an alternative and picks
-    whichever performs better on the validation set.
+    Uses WALK-FORWARD validation + SHARPE RATIO to pick optimal stop:
+    - Train: finds candidates on first WALK_FORWARD_TRAIN_DAYS days
+    - Validate: scores each on last WALK_FORWARD_VALIDATE_DAYS days
+    - Picks winner by SHARPE RATIO (risk-adjusted) not just raw avg P&L
+      This prevents picking a stop that won big once but is inconsistent
+    - Also tests ATR-based stop and picks whichever has better Sharpe
 
     Returns (optimal_pct: float, report: str, best_avg_pnl: float)
     """
@@ -244,12 +311,10 @@ def calibrate_trailing_stop(symbol, days_back=DAYS_BACK):
         if hist.empty or len(hist) < 20:
             return TRAILING_STOP_PCT, f"{symbol}: insufficient data, using default {TRAILING_STOP_PCT}%", None
 
-        # ---- Split into train / validate windows ----
         hist["date"] = hist.index.date
         unique_days  = sorted(hist["date"].unique())
 
         if len(unique_days) < WALK_FORWARD_TRAIN_DAYS + 2:
-            # Not enough days — fall back to single window
             train_hist    = hist
             validate_hist = hist
         else:
@@ -257,72 +322,116 @@ def calibrate_trailing_stop(symbol, days_back=DAYS_BACK):
             train_hist    = hist[hist["date"] <= train_cutoff]
             validate_hist = hist[hist["date"] > train_cutoff]
 
-        # ---- Daily data for ATR (need OHLC) ----
         daily_hist = ticker.history(period=f"{days_back}d", interval="1d")
         atr_series = compute_atr(daily_hist) if not daily_hist.empty else None
 
-        # ---- PHASE 1: Find best fixed % on training data ----
-        best_train_pct     = TRAILING_STOP_PCT
-        best_train_avg_pnl = None
-        train_lines        = []
-
+        # ---- PHASE 1: Find best candidates on training data ----
+        train_candidates = []
         for candidate in CALIBRATION_CANDIDATES:
             results = _run_ticker(symbol, train_hist.copy(), trailing_stop_pct=candidate,
                                   grace_period_minutes=GRACE_PERIOD_MINUTES)
             if len(results) < MIN_TRADES_FOR_CALIBRATION:
                 continue
-            df        = pd.DataFrame(results)
-            avg_pnl   = df["pnl_pct"].mean()
-            train_lines.append((candidate, avg_pnl, len(results)))
-            if best_train_avg_pnl is None or avg_pnl > best_train_avg_pnl:
-                best_train_avg_pnl = avg_pnl
-                best_train_pct     = candidate
+            pnl_list   = [r["pnl_pct"] for r in results]
+            avg_pnl    = np.mean(pnl_list)
+            sharpe     = compute_sharpe(pnl_list)
+            train_candidates.append((candidate, avg_pnl, sharpe))
 
-        # ---- PHASE 2: Validate best fixed % on validation data ----
-        validate_results = _run_ticker(symbol, validate_hist.copy(),
-                                       trailing_stop_pct=best_train_pct,
-                                       grace_period_minutes=GRACE_PERIOD_MINUTES)
-        if validate_results:
-            val_df          = pd.DataFrame(validate_results)
-            validated_pnl   = val_df["pnl_pct"].mean()
-        else:
-            validated_pnl   = best_train_avg_pnl or 0.0
+        if not train_candidates:
+            return TRAILING_STOP_PCT, f"{symbol}: insufficient trades in training, using default", None
 
-        # ---- PHASE 3: Test ATR-based stop on validation data ----
-        atr_validated_pnl = None
+        # ---- PHASE 2: Validate on out-of-sample data using SHARPE as primary metric ----
+        best_fixed_pct    = TRAILING_STOP_PCT
+        best_val_sharpe   = None
+        best_val_pnl      = None
+        validate_lines    = []
+
+        for candidate, train_pnl, train_sharpe in train_candidates:
+            val_results = _run_ticker(symbol, validate_hist.copy(),
+                                      trailing_stop_pct=candidate,
+                                      grace_period_minutes=GRACE_PERIOD_MINUTES)
+            if not val_results:
+                validate_lines.append(f"  {candidate}%: no validation trades")
+                continue
+
+            val_pnl_list = [r["pnl_pct"] for r in val_results]
+            val_avg_pnl  = np.mean(val_pnl_list)
+            val_sharpe   = compute_sharpe(val_pnl_list)
+
+            validate_lines.append(
+                f"  {candidate}%: val avg P&L={val_avg_pnl:+.2f}%  "
+                f"val Sharpe={val_sharpe:.3f if val_sharpe else 'N/A'}  "
+                f"({len(val_results)} trades)"
+            )
+
+            # Pick by Sharpe ratio — more consistent is better than lucky avg
+            if val_sharpe is not None:
+                if best_val_sharpe is None or val_sharpe > best_val_sharpe:
+                    best_val_sharpe = val_sharpe
+                    best_fixed_pct  = candidate
+                    best_val_pnl    = val_avg_pnl
+            elif best_val_pnl is None or val_avg_pnl > best_val_pnl:
+                best_val_pnl   = val_avg_pnl
+                best_fixed_pct = candidate
+
+        # ---- PHASE 3: Test ATR on validation data ----
+        atr_val_sharpe = None
+        atr_val_pnl    = None
+        avg_atr_stop   = TRAILING_STOP_PCT
+
         if atr_series is not None and not atr_series.empty:
             atr_results = _run_ticker(symbol, validate_hist.copy(),
                                       trailing_stop_pct=TRAILING_STOP_PCT,
                                       grace_period_minutes=GRACE_PERIOD_MINUTES,
-                                      use_atr=True,
-                                      atr_series=atr_series)
+                                      use_atr=True, atr_series=atr_series)
             if atr_results:
-                atr_df            = pd.DataFrame(atr_results)
-                atr_validated_pnl = atr_df["pnl_pct"].mean()
-                avg_atr_stop      = atr_df["trailing_stop_used"].mean()
-            else:
-                atr_validated_pnl = None
+                atr_pnl_list  = [r["pnl_pct"] for r in atr_results]
+                atr_val_pnl   = np.mean(atr_pnl_list)
+                atr_val_sharpe = compute_sharpe(atr_pnl_list)
+                avg_atr_stop  = np.mean([r["trailing_stop_used"] for r in atr_results])
 
-        # ---- Pick winner: fixed % vs ATR ----
+        # ---- Pick winner: fixed % vs ATR (by Sharpe) ----
         use_atr_final = False
-        if atr_validated_pnl is not None and atr_validated_pnl > validated_pnl:
+        if (atr_val_sharpe is not None and best_val_sharpe is not None
+                and atr_val_sharpe > best_val_sharpe):
             use_atr_final = True
-            final_pnl     = atr_validated_pnl
-            final_pct     = round(avg_atr_stop, 1) if 'avg_atr_stop' in dir() else best_train_pct
+            final_pnl     = atr_val_pnl
+            final_pct     = round(avg_atr_stop, 1)
+            final_sharpe  = atr_val_sharpe
+        elif (atr_val_pnl is not None and best_val_pnl is None
+              and atr_val_pnl > 0):
+            use_atr_final = True
+            final_pnl     = atr_val_pnl
+            final_pct     = round(avg_atr_stop, 1)
+            final_sharpe  = atr_val_sharpe
         else:
-            final_pnl = validated_pnl
-            final_pct = best_train_pct
+            final_pnl    = best_val_pnl or 0.0
+            final_pct    = best_fixed_pct
+            final_sharpe = best_val_sharpe
 
         # ---- Build report ----
-        report_lines = [f"{symbol} walk-forward calibration (train {WALK_FORWARD_TRAIN_DAYS}d / validate {WALK_FORWARD_VALIDATE_DAYS}d):"]
-        report_lines.append(f"  Training phase — best fixed stop: {best_train_pct}% (train avg P&L: {best_train_avg_pnl:+.2f}%)" if best_train_avg_pnl is not None else "  Training: inconclusive")
-        report_lines.append(f"  Validation — fixed {best_train_pct}%: avg P&L {validated_pnl:+.2f}%")
-        if atr_validated_pnl is not None:
-            report_lines.append(f"  Validation — ATR-based (avg stop ~{avg_atr_stop:.1f}%): avg P&L {atr_validated_pnl:+.2f}%")
-        report_lines.append(f"  → WINNER: {'ATR-based' if use_atr_final else f'fixed {final_pct}%'} (validated avg P&L {final_pnl:+.2f}%)")
+        report_lines = [
+            f"{symbol} walk-forward calibration "
+            f"(train {WALK_FORWARD_TRAIN_DAYS}d / validate {WALK_FORWARD_VALIDATE_DAYS}d):"
+        ]
+        report_lines.extend(validate_lines)
+        if atr_val_pnl is not None:
+            report_lines.append(
+                f"  ATR-based (avg stop ~{avg_atr_stop:.1f}%): "
+                f"val avg P&L={atr_val_pnl:+.2f}%  "
+                f"val Sharpe={atr_val_sharpe:.3f if atr_val_sharpe else 'N/A'}"
+            )
+        winner_type = f"ATR-based (~{final_pct}%)" if use_atr_final else f"fixed {final_pct}%"
+        report_lines.append(
+            f"  → WINNER: {winner_type} | "
+            f"validated avg P&L {final_pnl:+.2f}% | "
+            f"Sharpe {final_sharpe:.3f if final_sharpe else 'N/A'}"
+        )
         report = "\n".join(report_lines)
 
-        print(f"📐 {symbol} calibrated trailing stop: {final_pct}% (best avg P&L: {final_pnl:+.2f}%)")
+        sharpe_str = f"{final_sharpe:.3f}" if final_sharpe is not None else "N/A"
+        print(f"📐 {symbol} calibrated trailing stop: {final_pct}% "
+              f"(val avg P&L: {final_pnl:+.2f}%, Sharpe: {sharpe_str})")
         return final_pct, report, final_pnl
 
     except Exception as e:
@@ -335,7 +444,6 @@ def calibrate_trailing_stop(symbol, days_back=DAYS_BACK):
 # ---------------------------------------------------------------------------
 
 def run_backtest():
-    """Runs fixed trailing stop backtest on all TICKERS."""
     results = []
     for symbol in TICKERS:
         print(f"\nFetching {symbol}...")
@@ -353,7 +461,6 @@ def run_backtest():
 
 
 def run_atr_backtest():
-    """Runs ATR-based trailing stop backtest on all TICKERS for comparison."""
     results = []
     for symbol in TICKERS:
         print(f"\nFetching {symbol} (ATR mode)...")
@@ -389,14 +496,23 @@ def summarize(results, label="FIXED TRAILING STOP"):
     print(f"Best trade             : {df['pnl_pct'].max():.2f}%")
     print(f"Worst trade            : {df['pnl_pct'].min():.2f}%")
 
+    # Sharpe ratio for full backtest
+    overall_sharpe = compute_sharpe(df["pnl_pct"].tolist())
+    print(f"Overall Sharpe ratio   : {overall_sharpe:.3f if overall_sharpe else 'N/A'}")
+
     print("\nExit reason breakdown:")
     print(df["exit_reason"].value_counts())
 
     print("\nAvg P&L by exit reason:")
     print(df.groupby("exit_reason")["pnl_pct"].mean().round(2))
 
-    print("\nPer-symbol average P&L:")
-    print(df.groupby("symbol")["pnl_pct"].mean().round(2).sort_values(ascending=False))
+    print("\nPer-symbol average P&L and Sharpe:")
+    for symbol in df["symbol"].unique():
+        sym_df  = df[df["symbol"] == symbol]
+        avg_pnl = sym_df["pnl_pct"].mean()
+        sharpe  = compute_sharpe(sym_df["pnl_pct"].tolist())
+        print(f"  {symbol}: avg P&L={avg_pnl:+.2f}%  Sharpe={sharpe:.3f if sharpe else 'N/A'}  "
+              f"({len(sym_df)} trades)")
 
     if "held_overnight" in df.columns:
         overnight_count = df["held_overnight"].sum()
@@ -409,6 +525,23 @@ def summarize(results, label="FIXED TRAILING STOP"):
     if "trailing_stop_used" in df.columns:
         print(f"\nAvg trailing stop used: {df['trailing_stop_used'].mean():.2f}%")
 
+    # Monte Carlo simulation
+    print("\n" + "=" * 60)
+    print(f"MONTE CARLO SIMULATION ({MONTE_CARLO_SIMULATIONS} runs, {MONTE_CARLO_SEQUENCE_LEN} trades each)")
+    print("=" * 60)
+    mc = run_monte_carlo(df["pnl_pct"].tolist())
+    if mc:
+        print(f"Median total return    : {mc['median_return']:+.2f}%")
+        print(f"Mean total return      : {mc['mean_return']:+.2f}%")
+        print(f"Best case (95th pct)   : {mc['best_case']:+.2f}%")
+        print(f"Worst case (5th pct)   : {mc['worst_case']:+.2f}%")
+        print(f"% of runs profitable   : {mc['pct_profitable']:.1f}%")
+        print(f"Avg max drawdown       : {mc['avg_max_drawdown']:+.2f}%")
+        print(f"Worst drawdown seen    : {mc['worst_drawdown']:+.2f}%")
+        print(f"Avg Sharpe across runs : {mc['avg_sharpe']:.3f if mc['avg_sharpe'] else 'N/A'}")
+    else:
+        print("Insufficient data for Monte Carlo simulation.")
+
 
 if __name__ == "__main__":
     print(f"Running backtest: {TICKERS}")
@@ -416,25 +549,22 @@ if __name__ == "__main__":
           f"Hard Ceiling={HARD_PROFIT_CEILING}% | Grace Period={GRACE_PERIOD_MINUTES}min")
     print(f"Check interval: every {CHECK_INTERVAL_MINUTES} min | Lookback: {DAYS_BACK} days\n")
 
-    # Run fixed trailing stop
     results_fixed = run_backtest()
     summarize(results_fixed, label="FIXED TRAILING STOP")
 
-    # Run ATR-based trailing stop
     print("\n" + "=" * 60)
     print("Running ATR-based trailing stop comparison...")
     results_atr = run_atr_backtest()
     summarize(results_atr, label="ATR-BASED TRAILING STOP")
 
-    # Walk-forward calibration
     print("\n" + "=" * 60)
-    print(f"WALK-FORWARD CALIBRATION (train {WALK_FORWARD_TRAIN_DAYS}d / validate {WALK_FORWARD_VALIDATE_DAYS}d)")
+    print(f"WALK-FORWARD CALIBRATION WITH SHARPE "
+          f"(train {WALK_FORWARD_TRAIN_DAYS}d / validate {WALK_FORWARD_VALIDATE_DAYS}d)")
     print("=" * 60)
     for symbol in TICKERS:
         optimal, report, pnl = calibrate_trailing_stop(symbol)
         print(report)
 
-    # Save results
     if results_fixed:
         pd.DataFrame(results_fixed).to_csv("backtest_results_fixed.csv", index=False)
     if results_atr:
