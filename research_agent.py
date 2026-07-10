@@ -19,18 +19,23 @@ ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 MIN_MARKET_CAP = 10_000_000_000
 
 # ---- QUALITY FILTERS ----
-MIN_CONVICTION_SCORE = 0.25
-MIN_TRAILING_STOP    = 2.5
-EARNINGS_BLOCK_DAYS  = 5
+MIN_CONVICTION_SCORE    = 0.25
+MIN_TRAILING_STOP       = 2.5
+EARNINGS_BLOCK_DAYS     = 5
+DOWNTREND_BLOCK_PCT     = 15.0
 
-# ---- DOWNTREND FILTER ----
-# Block stocks where price is this % below their 30-day high
-# Catches falling knives like IREN that look oversold but are in freefall
-DOWNTREND_BLOCK_PCT  = 15.0
+# ---- VOLUME CONFIRMATION FILTER ----
+# Research shows mean reversion trades with volume 30%+ above average
+# have 81% win rate vs 61% without — hard requirement
+MIN_VOLUME_RATIO        = 1.3    # must be at least 1.3x average volume
+VOLUME_FILTER_ENABLED   = True   # set False to disable during low-volume days
+
+# ---- SECTOR DIVERSIFICATION ----
+# Never buy more than this many stocks from the same sector
+MAX_SAME_SECTOR         = 1
 
 # ---- HIGH CONVICTION ANCHOR LIST ----
 # Trimmed to top 12 highest conviction names based on backtest results
-# Sorted by historical avg P&L
 HIGH_CONVICTION_ANCHORS = [
     "ARM",   # +2.43%
     "HOOD",  # +2.43%
@@ -46,6 +51,23 @@ HIGH_CONVICTION_ANCHORS = [
     "NOW",   # +1.02%
 ]
 
+# ---- SECTOR MAP for diversification check ----
+SECTOR_MAP = {
+    "ARM": "Technology", "NVDA": "Technology", "AMD": "Technology",
+    "MSFT": "Technology", "AAPL": "Technology", "GOOGL": "Technology",
+    "META": "Technology", "NOW": "Technology", "CRM": "Technology",
+    "SHOP": "Technology", "ORCL": "Technology", "AVGO": "Technology",
+    "MU": "Technology", "SMCI": "Technology", "PLTR": "Technology",
+    "HOOD": "Finance", "GS": "Finance", "JPM": "Finance",
+    "V": "Finance", "MA": "Finance", "PYPL": "Finance", "COIN": "Finance",
+    "UNH": "Healthcare", "JNJ": "Healthcare", "LLY": "Healthcare",
+    "SNOW": "Cloud", "DASH": "Consumer", "CAT": "Industrial",
+    "TSLA": "Automotive", "RIVN": "Automotive",
+    "XOM": "Energy", "CVX": "Energy",
+    "AMZN": "Consumer", "WMT": "Consumer", "HD": "Consumer",
+    "MARA": "Crypto", "HOOD": "Finance",
+}
+
 FALLBACK_WATCHLIST = [
     "AAPL", "MSFT", "NVDA", "META", "TSLA", "AMZN", "GOOGL",
     "AMD", "AVGO", "MU", "CRM", "ORCL", "NOW", "UBER", "SHOP",
@@ -57,12 +79,8 @@ FALLBACK_WATCHLIST = [
     "MARA", "HOOD"
 ]
 
+
 def get_dynamic_watchlist(top_n=20):
-    """
-    Builds a blended watchlist:
-    1. Alpaca most-actives screener (live market momentum)
-    2. HIGH_CONVICTION_ANCHORS (trimmed to top 12 proven stocks)
-    """
     screener_stocks = []
     try:
         url = "https://data.alpaca.markets/v1beta1/screener/stocks/most-actives"
@@ -128,19 +146,13 @@ def check_earnings_block(symbol):
 
 
 def check_downtrend(symbol):
-    """
-    Returns (blocked: bool, pct_below_high: float)
-    Blocks stocks that are more than DOWNTREND_BLOCK_PCT% below their 30-day high.
-    Catches falling knives that look oversold on RSI but are in a clear downtrend.
-    A stock can be RSI=20 and still be a falling knife — this filter catches that.
-    """
     try:
         hist = yf.Ticker(symbol).history(period="30d")
         if hist.empty or len(hist) < 5:
             return False, 0.0
-        high_30d     = hist["Close"].max()
-        current      = hist["Close"].iloc[-1]
-        pct_below    = ((high_30d - current) / high_30d) * 100
+        high_30d  = hist["Close"].max()
+        current   = hist["Close"].iloc[-1]
+        pct_below = ((high_30d - current) / high_30d) * 100
         if pct_below >= DOWNTREND_BLOCK_PCT:
             return True, round(pct_below, 1)
         return False, round(pct_below, 1)
@@ -149,22 +161,159 @@ def check_downtrend(symbol):
 
 
 def get_vwap(hist):
-    """
-    Calculates VWAP (Volume Weighted Average Price) for the last 5 days
-    of intraday-equivalent data using daily OHLC.
-    Returns (vwap, pct_above_vwap) where positive = bullish, negative = bearish.
-    """
     try:
         if hist.empty or len(hist) < 5:
             return "N/A", "N/A"
-        recent       = hist.tail(5)
+        recent        = hist.tail(5)
         typical_price = (recent["High"] + recent["Low"] + recent["Close"]) / 3
-        vwap         = (typical_price * recent["Volume"]).sum() / recent["Volume"].sum()
-        current      = hist["Close"].iloc[-1]
-        pct_vs_vwap  = round(((current - vwap) / vwap) * 100, 2)
+        vwap          = (typical_price * recent["Volume"]).sum() / recent["Volume"].sum()
+        current       = hist["Close"].iloc[-1]
+        pct_vs_vwap   = round(((current - vwap) / vwap) * 100, 2)
         return round(vwap, 2), pct_vs_vwap
     except:
         return "N/A", "N/A"
+
+
+def get_macd(hist):
+    """
+    Calculates MACD (Moving Average Convergence Divergence).
+    MACD line = 12-day EMA - 26-day EMA
+    Signal line = 9-day EMA of MACD
+    Histogram = MACD - Signal
+    Bullish: MACD crosses above signal line (histogram turns positive)
+    Bearish: MACD crosses below signal line (histogram turns negative)
+    """
+    try:
+        if hist.empty or len(hist) < 30:
+            return "N/A", "N/A", "N/A"
+        close       = hist["Close"]
+        ema12       = close.ewm(span=12, adjust=False).mean()
+        ema26       = close.ewm(span=26, adjust=False).mean()
+        macd_line   = ema12 - ema26
+        signal_line = macd_line.ewm(span=9, adjust=False).mean()
+        histogram   = macd_line - signal_line
+
+        macd_val    = round(macd_line.iloc[-1], 3)
+        signal_val  = round(signal_line.iloc[-1], 3)
+        hist_val    = round(histogram.iloc[-1], 3)
+
+        # Detect crossover in last 2 bars
+        prev_hist   = histogram.iloc[-2]
+        curr_hist   = histogram.iloc[-1]
+        if prev_hist < 0 and curr_hist > 0:
+            crossover = "🟢 BULLISH CROSSOVER — MACD crossed above signal"
+        elif prev_hist > 0 and curr_hist < 0:
+            crossover = "🔴 BEARISH CROSSOVER — MACD crossed below signal"
+        elif curr_hist > 0:
+            crossover = "Bullish momentum (MACD above signal)"
+        else:
+            crossover = "Bearish momentum (MACD below signal)"
+
+        return macd_val, signal_val, crossover
+    except:
+        return "N/A", "N/A", "N/A"
+
+
+def get_bollinger_bands(hist, window=20, num_std=2):
+    """
+    Calculates Bollinger Bands.
+    Upper band = SMA + (std * num_std)
+    Lower band = SMA - (std * num_std)
+    Price near upper band = overbought
+    Price near lower band = oversold / potential bounce
+    %B = (price - lower) / (upper - lower) — 0=at lower, 1=at upper, >1=above upper
+    """
+    try:
+        if hist.empty or len(hist) < window:
+            return "N/A", "N/A", "N/A", "N/A"
+        close      = hist["Close"]
+        sma        = close.rolling(window=window).mean()
+        std        = close.rolling(window=window).std()
+        upper      = sma + (std * num_std)
+        lower      = sma - (std * num_std)
+        current    = close.iloc[-1]
+        upper_val  = round(upper.iloc[-1], 2)
+        lower_val  = round(lower.iloc[-1], 2)
+        sma_val    = round(sma.iloc[-1], 2)
+
+        band_width = upper_val - lower_val
+        if band_width > 0:
+            pct_b  = round((current - lower_val) / band_width * 100, 1)
+        else:
+            pct_b  = 50.0
+
+        if pct_b > 80:
+            bb_signal = f"Near upper band ({pct_b}%B) — overbought, caution"
+        elif pct_b < 20:
+            bb_signal = f"Near lower band ({pct_b}%B) — oversold, potential bounce"
+        else:
+            bb_signal = f"Middle of bands ({pct_b}%B) — neutral"
+
+        return upper_val, lower_val, sma_val, bb_signal
+    except:
+        return "N/A", "N/A", "N/A", "N/A"
+
+
+def get_market_regime():
+    """
+    Detects whether the overall market is trending or range-bound
+    using SPY (S&P 500 ETF) as proxy.
+    Trending up:   SPY above 20-day SMA and 5-day momentum positive
+    Trending down: SPY below 20-day SMA and 5-day momentum negative
+    Range-bound:   SPY near SMA with low momentum
+    Returns regime string passed to GPT-4o to adjust strategy.
+    """
+    try:
+        spy  = yf.Ticker("SPY")
+        hist = spy.history(period="30d")
+        if hist.empty or len(hist) < 20:
+            return "Unknown"
+
+        close      = hist["Close"]
+        sma20      = close.rolling(window=20).mean().iloc[-1]
+        current    = close.iloc[-1]
+        momentum5d = ((close.iloc[-1] - close.iloc[-5]) / close.iloc[-5]) * 100
+
+        pct_vs_sma = ((current - sma20) / sma20) * 100
+
+        if pct_vs_sma > 1.0 and momentum5d > 0.5:
+            return f"TRENDING UP (SPY {pct_vs_sma:+.1f}% above 20d SMA, +{momentum5d:.1f}% 5d momentum) — favor momentum picks"
+        elif pct_vs_sma < -1.0 and momentum5d < -0.5:
+            return f"TRENDING DOWN (SPY {pct_vs_sma:+.1f}% below 20d SMA, {momentum5d:.1f}% 5d momentum) — be selective, reduce exposure"
+        else:
+            return f"RANGE-BOUND (SPY {pct_vs_sma:+.1f}% vs 20d SMA, {momentum5d:.1f}% 5d momentum) — favor mean reversion picks"
+    except:
+        return "Unknown"
+
+
+def get_weekly_trend(symbol):
+    """
+    Checks weekly timeframe trend for multi-timeframe confirmation.
+    Returns brief signal: weekly trend direction vs daily.
+    Aligned = stronger signal. Conflicted = use caution.
+    """
+    try:
+        hist_weekly = yf.Ticker(symbol).history(period="90d", interval="1wk")
+        if hist_weekly.empty or len(hist_weekly) < 4:
+            return "Weekly data unavailable"
+        close       = hist_weekly["Close"]
+        momentum_4w = round(((close.iloc[-1] - close.iloc[-4]) / close.iloc[-4]) * 100, 1)
+        sma4w       = close.tail(4).mean()
+        current     = close.iloc[-1]
+
+        if current > sma4w and momentum_4w > 0:
+            return f"Weekly uptrend ({momentum_4w:+.1f}% 4wk) — aligned with daily ✅"
+        elif current < sma4w and momentum_4w < 0:
+            return f"Weekly downtrend ({momentum_4w:+.1f}% 4wk) — caution ⚠️"
+        else:
+            return f"Weekly mixed ({momentum_4w:+.1f}% 4wk) — no clear direction"
+    except:
+        return "Weekly data unavailable"
+
+
+def get_sector(symbol):
+    """Returns sector for diversification check."""
+    return SECTOR_MAP.get(symbol, "Unknown")
 
 
 def get_news_sentiment(symbol, company_name):
@@ -181,6 +330,7 @@ def get_news_sentiment(symbol, company_name):
         return " | ".join(a["title"] for a in articles[:5])
     except:
         return "News fetch failed"
+
 
 def get_earnings_info(ticker_obj):
     try:
@@ -202,6 +352,7 @@ def get_earnings_info(ticker_obj):
     except:
         return "Earnings data unavailable"
 
+
 def get_insider_activity(ticker_obj):
     try:
         insider = ticker_obj.insider_purchases
@@ -215,6 +366,7 @@ def get_insider_activity(ticker_obj):
         return "No recent insider buying"
     except:
         return "Insider data unavailable"
+
 
 def get_analyst_rating(ticker_obj):
     try:
@@ -230,6 +382,7 @@ def get_analyst_rating(ticker_obj):
         return "No recent upgrades"
     except:
         return "Analyst data unavailable"
+
 
 def get_finnhub_data(symbol):
     if not FINNHUB_API_KEY:
@@ -286,9 +439,44 @@ def calibrate_watchlist_parallel(watchlist):
     return calibration
 
 
-def research_stocks():
+def apply_sector_diversification(picks, max_same_sector=MAX_SAME_SECTOR):
+    """
+    Given a list of top picks from GPT-4o, enforce sector diversification.
+    Never return more than max_same_sector stocks from the same sector.
+    Returns filtered list.
+    """
+    sector_counts = {}
+    diversified   = []
+    removed       = []
+
+    for symbol in picks:
+        sector = get_sector(symbol)
+        count  = sector_counts.get(sector, 0)
+        if sector == "Unknown" or count < max_same_sector:
+            diversified.append(symbol)
+            sector_counts[sector] = count + 1
+        else:
+            removed.append(f"{symbol} ({sector} already at max {max_same_sector})")
+
+    if removed:
+        print(f"🔀 Sector diversification removed: {', '.join(removed)}")
+
+    return diversified
+
+
+def research_stocks(previously_held=None):
+    """
+    Main research function.
+    previously_held — list of symbols held yesterday that stopped out or hit ceiling.
+                      Used for re-entry logic: if they still pass all filters today,
+                      they get priority consideration.
+    """
     print("🔍 Building blended watchlist (Alpaca screener + top 12 conviction anchors)...")
     watchlist = get_dynamic_watchlist(top_n=20)
+
+    # ---- Market regime detection ----
+    market_regime = get_market_regime()
+    print(f"📊 Market regime: {market_regime}")
 
     calibration = calibrate_watchlist_parallel(watchlist)
 
@@ -305,9 +493,9 @@ def research_stocks():
     if earnings_blocked:
         print(f"🚫 Earnings blocked: {', '.join(earnings_blocked)}")
 
-    # ---- FILTER 2: Downtrend filter (falling knife protection) ----
-    downtrend_blocked      = []
-    post_downtrend_filter  = []
+    # ---- FILTER 2: Downtrend filter ----
+    downtrend_blocked     = []
+    post_downtrend_filter = []
     for symbol in post_earnings_filter:
         blocked, pct_below = check_downtrend(symbol)
         if blocked:
@@ -318,7 +506,7 @@ def research_stocks():
     if downtrend_blocked:
         print(f"🚫 Downtrend blocked: {', '.join(downtrend_blocked)}")
 
-    # ---- FILTERS 3-5: Negative P&L, low conviction, choppy ----
+    # ---- FILTERS 3-6: P&L, conviction, choppy, zero score ----
     filtered_watchlist = []
     rejected           = []
     for symbol in post_downtrend_filter:
@@ -330,6 +518,10 @@ def research_stocks():
             continue
         if pnl <= 0:
             rejected.append(f"{symbol} (negative P&L: {pnl:+.2f}%)")
+            continue
+        # FIX: block exactly 0.00% — walk-forward returning zero means inconclusive
+        if pnl == 0.0:
+            rejected.append(f"{symbol} (zero conviction score — inconclusive)")
             continue
         if pnl < MIN_CONVICTION_SCORE:
             rejected.append(f"{symbol} (low conviction: {pnl:+.2f}% < {MIN_CONVICTION_SCORE}%)")
@@ -343,7 +535,7 @@ def research_stocks():
     if rejected:
         print(f"🚫 Filtered out: {', '.join(rejected)}")
 
-    # Relax to positive P&L only if nothing passes
+    # Relax if nothing passes
     if not filtered_watchlist:
         print("⚠️ All stocks filtered out — relaxing conviction threshold, keeping positive P&L only")
         for symbol in post_downtrend_filter:
@@ -362,6 +554,13 @@ def research_stocks():
             "trailing_stops":    {},
             "conviction_scores": {}
         }
+
+    # ---- Re-entry candidates ----
+    reentry_candidates = []
+    if previously_held:
+        reentry_candidates = [s for s in previously_held if s in filtered_watchlist]
+        if reentry_candidates:
+            print(f"🔄 Re-entry candidates (passed filters again): {reentry_candidates}")
 
     results = []
     for symbol in filtered_watchlist:
@@ -397,13 +596,37 @@ def research_stocks():
             if volume != "N/A" and avg_volume and avg_volume > 0:
                 volume_ratio = round(volume / avg_volume, 2)
 
-            # VWAP calculation
+            # ---- Volume confirmation filter ----
+            volume_flag = ""
+            if VOLUME_FILTER_ENABLED and volume_ratio != "N/A":
+                if volume_ratio < MIN_VOLUME_RATIO:
+                    volume_flag = f" ⚠️ LOW VOLUME ({volume_ratio}x avg — below {MIN_VOLUME_RATIO}x threshold)"
+                else:
+                    volume_flag = f" ✅ Volume confirmed ({volume_ratio}x avg)"
+
+            # VWAP
             vwap, pct_vs_vwap = get_vwap(hist)
             if pct_vs_vwap != "N/A":
-                vwap_label = f"VWAP=${vwap} | Price vs VWAP: {pct_vs_vwap:+.2f}% " \
-                             f"({'above — bullish' if pct_vs_vwap > 0 else 'below — bearish'})"
+                vwap_label = (f"VWAP=${vwap} | Price vs VWAP: {pct_vs_vwap:+.2f}% "
+                              f"({'above — bullish' if pct_vs_vwap > 0 else 'below — bearish'})")
             else:
                 vwap_label = "VWAP: unavailable"
+
+            # MACD
+            macd_val, signal_val, macd_signal = get_macd(hist)
+            macd_label = (f"MACD={macd_val} | Signal={signal_val} | {macd_signal}"
+                          if macd_val != "N/A" else "MACD: unavailable")
+
+            # Bollinger Bands
+            bb_upper, bb_lower, bb_sma, bb_signal = get_bollinger_bands(hist)
+            bb_label = (f"Bollinger Bands: Upper=${bb_upper} | SMA=${bb_sma} | Lower=${bb_lower} | {bb_signal}"
+                        if bb_upper != "N/A" else "Bollinger Bands: unavailable")
+
+            # Weekly trend (multi-timeframe)
+            weekly_trend = get_weekly_trend(symbol)
+
+            # Re-entry flag
+            reentry_flag = " 🔄 RE-ENTRY CANDIDATE (passed all filters again)" if symbol in reentry_candidates else ""
 
             news     = get_news_sentiment(symbol, name)
             earnings = get_earnings_info(ticker)
@@ -416,21 +639,25 @@ def research_stocks():
             pnl_display        = f"{float(best_avg_pnl):+.2f}%" if best_avg_pnl is not None else "N/A"
 
             summary = (
-                f"{name} ({symbol}): Price=${price}, PE={pe_ratio}, "
+                f"{name} ({symbol}){reentry_flag}: Price=${price}, PE={pe_ratio}, "
                 f"52W High={week_high}, 52W Low={week_low}, "
                 f"RSI={rsi}, 5-Day Momentum={momentum}%, "
-                f"Volume Ratio={volume_ratio}x avg, Market Cap={market_cap}\n"
+                f"Volume Ratio={volume_ratio}x avg{volume_flag}, Market Cap={market_cap}\n"
                 f"  Earnings: {earnings}\n"
                 f"  Insider Activity: {insider}\n"
                 f"  Analyst Rating: {analyst}\n"
                 f"  News: {news}\n"
                 f"  Cross-check: {finnhub}\n"
                 f"  {vwap_label}\n"
+                f"  {macd_label}\n"
+                f"  {bb_label}\n"
+                f"  Weekly trend: {weekly_trend}\n"
                 f"  Backtest-calibrated trailing stop: {optimal_stop}% "
                 f"(avg P&L: {pnl_display}, 90-min grace period active after entry)"
             )
             results.append({"symbol": symbol, "summary": summary,
-                            "optimal_stop": optimal_stop})
+                            "optimal_stop": optimal_stop,
+                            "volume_ratio": volume_ratio})
 
         except Exception as e:
             print(f"Error fetching {symbol}: {e}")
@@ -440,35 +667,45 @@ def research_stocks():
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {"role": "system", "content": """You are an expert stock research analyst.
+            {"role": "system", "content": f"""You are an expert stock research analyst.
+Current market regime: {market_regime}
+
 Analyze stocks using technical indicators, earnings timing, insider activity, and analyst ratings.
 RSI below 30 = oversold (potential buy). RSI above 70 = overbought (avoid).
-High volume ratio = strong institutional interest.
+High volume ratio = strong institutional interest. Prefer stocks with volume 1.3x+ average.
 Insider buying = very bullish signal.
 Analyst upgrades = momentum catalyst.
+
 Every stock shown has already passed multiple quality filters:
-- Positive historical avg P&L of at least +0.25%
+- Positive historical avg P&L (above zero, minimum +0.25%)
 - Calibrated trailing stop of at least 2.5% (trending cleanly, not choppy)
 - No earnings within 5 days
 - Not more than 15% below its 30-day high (no falling knives)
-These are pre-vetted quality candidates. Pick the best 3 based on today's setup.
-VWAP (Volume Weighted Average Price) is a key signal:
-- Price above VWAP = bullish, institutional buying pressure
-- Price below VWAP = bearish, selling pressure
-- Prefer stocks trading above their VWAP with positive momentum
-If fewer than 3 look genuinely good today, pick fewer —
-it is better to sit on cash than force a bad trade.
-The "Backtest-calibrated trailing stop" and avg P&L show historical performance.
-Higher avg P&L = stronger historical edge. Higher trailing stop = cleaner trend.
+
+KEY SIGNALS TO WEIGHT (in order of importance):
+1. MACD — bullish crossover is the strongest momentum confirmation signal
+2. VWAP — price above VWAP = institutional buying pressure (bullish)
+3. Bollinger Bands — near lower band = oversold bounce potential; near upper = overbought
+4. Volume confirmation — stocks with volume 1.3x+ average have significantly higher win rates
+5. Weekly trend — prefer stocks where weekly and daily trends are aligned
+6. RSI — secondary signal, use to confirm not to lead
+7. Re-entry candidates — stocks that passed yesterday and pass again today have extra confirmation
+
+Market regime adjustment:
+- TRENDING UP: favor momentum picks with MACD bullish crossover and price above VWAP
+- TRENDING DOWN: be very selective, require multiple confirming signals, pick fewer
+- RANGE-BOUND: favor mean reversion (oversold RSI + near Bollinger lower band)
+
+If fewer than 3 look genuinely good today, pick fewer — cash is better than a bad trade.
+
 Always end your response with EXACTLY this format, no bold, no company names, no periods:
 TOP_PICKS:
 1: TICKER
 2: TICKER
 3: TICKER
-If fewer than 3 qualify today, still use the format but only list the ones that do:
+If fewer than 3 qualify today:
 TOP_PICKS:
-1: TICKER
-2: TICKER"""},
+1: TICKER"""},
             {"role": "user", "content": f"Analyze these stocks and pick the top buy opportunities today:\n{research_data}"}
         ]
     )
@@ -485,12 +722,17 @@ TOP_PICKS:
             line    = line.replace("**", "").replace("*", "")
             matches = re.findall(r'\b[A-Z]{2,5}\b', line)
             for match in matches:
-                if match not in ("TOP", "PICKS", "RSI", "CEO", "ETF", "NYSE", "NA", "VWAP"):
+                if match not in ("TOP", "PICKS", "RSI", "CEO", "ETF", "NYSE", "NA",
+                                 "VWAP", "MACD", "SMA", "EMA", "BB"):
                     if match not in top_picks:
                         top_picks.append(match)
                         break
             if len(top_picks) >= 3:
                 break
+
+    # Apply sector diversification to final picks
+    if top_picks:
+        top_picks = apply_sector_diversification(top_picks)
 
     if not top_picks:
         print("🛑 GPT-4o found no quality picks today — sitting on cash.")
