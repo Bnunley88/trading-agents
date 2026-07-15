@@ -11,7 +11,6 @@ MODES:
          from backtest import calibrate_trailing_stop
          optimal_pct, report, best_avg_pnl = calibrate_trailing_stop("TSLA")
      Uses walk-forward validation + Sharpe ratio to pick the optimal stop.
-     More robust than raw avg P&L alone.
 
   3. ATR mode — trailing stop sized dynamically by Average True Range.
 
@@ -45,27 +44,23 @@ WALK_FORWARD_TRAIN_DAYS    = 20
 WALK_FORWARD_VALIDATE_DAYS = 10
 
 # ---- SHARPE RATIO CONFIG ----
-# Risk-free rate (annualized) — approx current T-bill rate
-RISK_FREE_RATE_ANNUAL = 0.05
-# Convert to per-trade rate assuming ~252 trading days, ~2 trades per day
+RISK_FREE_RATE_ANNUAL    = 0.05
 RISK_FREE_RATE_PER_TRADE = RISK_FREE_RATE_ANNUAL / (252 * 2)
-# Minimum Sharpe ratio to prefer a candidate over another with higher raw P&L
-# A Sharpe > 0.5 means the strategy has meaningful risk-adjusted returns
 MIN_SHARPE_FOR_PREFERENCE = 0.3
 
 # ---- MONTE CARLO CONFIG ----
-MONTE_CARLO_SIMULATIONS = 500    # number of random trade sequences to simulate
-MONTE_CARLO_SEQUENCE_LEN = 20   # trades per simulated sequence
+MONTE_CARLO_SIMULATIONS  = 500
+MONTE_CARLO_SEQUENCE_LEN = 20
+
+
+def fmt_sharpe(val):
+    """Safe Sharpe formatter — avoids conditional f-string issues in Python 3.13."""
+    if val is None:
+        return "N/A"
+    return f"{val:.3f}"
 
 
 def compute_sharpe(pnl_series, risk_free_per_trade=RISK_FREE_RATE_PER_TRADE):
-    """
-    Computes Sharpe ratio for a series of trade P&L percentages.
-    Sharpe = (avg_return - risk_free) / std_return
-    Higher = better risk-adjusted returns.
-    >1.0 = excellent, >0.5 = good, >0.3 = acceptable, <0 = worse than cash
-    Returns None if insufficient data.
-    """
     try:
         if len(pnl_series) < 4:
             return None
@@ -75,7 +70,7 @@ def compute_sharpe(pnl_series, risk_free_per_trade=RISK_FREE_RATE_PER_TRADE):
         if std == 0:
             return None
         sharpe = (avg - risk_free_per_trade) / std
-        return round(sharpe, 3)
+        return round(float(sharpe), 3)
     except Exception:
         return None
 
@@ -85,13 +80,11 @@ def compute_atr(hist, period=ATR_PERIOD):
         high       = hist["High"]
         low        = hist["Low"]
         prev_close = hist["Close"].shift(1)
-
         tr = pd.concat([
             high - low,
             (high - prev_close).abs(),
             (low  - prev_close).abs()
         ], axis=1).max(axis=1)
-
         atr = tr.rolling(window=period).mean()
         return atr
     except Exception:
@@ -237,71 +230,50 @@ def _run_ticker(symbol, hist, trailing_stop_pct, grace_period_minutes=None,
 
 def run_monte_carlo(pnl_list, n_simulations=MONTE_CARLO_SIMULATIONS,
                     sequence_len=MONTE_CARLO_SEQUENCE_LEN):
-    """
-    Monte Carlo simulation — stress tests the strategy beyond a single historical path.
-
-    Takes the actual trade P&L results and randomly shuffles them into
-    n_simulations different sequences of sequence_len trades each.
-    This shows the range of possible outcomes if trades had occurred in a
-    different order, revealing:
-    - Best case / worst case equity curves
-    - Probability of drawdown exceeding X%
-    - How much luck vs skill is in the backtest results
-
-    Returns dict with simulation statistics.
-    """
     if len(pnl_list) < sequence_len:
         return None
 
-    pnl_array    = np.array(pnl_list)
+    pnl_array     = np.array(pnl_list)
     final_returns = []
     max_drawdowns = []
     sharpe_scores = []
 
     for _ in range(n_simulations):
-        # Random sample with replacement from actual trade results
-        sample      = np.random.choice(pnl_array, size=sequence_len, replace=True)
-        cum_return  = sample.sum()
+        sample     = np.random.choice(pnl_array, size=sequence_len, replace=True)
+        cum_return = sample.sum()
         final_returns.append(cum_return)
 
-        # Calculate max drawdown for this sequence
         equity = np.cumsum(sample)
         peak   = np.maximum.accumulate(equity)
         dd     = equity - peak
         max_drawdowns.append(dd.min())
 
-        # Sharpe for this sequence
         if sample.std() > 0:
-            sharpe_scores.append((sample.mean() - RISK_FREE_RATE_PER_TRADE) / sample.std())
+            sharpe_scores.append(
+                (sample.mean() - RISK_FREE_RATE_PER_TRADE) / sample.std()
+            )
 
     final_returns = np.array(final_returns)
     max_drawdowns = np.array(max_drawdowns)
 
     return {
-        "n_simulations":      n_simulations,
-        "sequence_len":       sequence_len,
-        "median_return":      round(np.median(final_returns), 2),
-        "mean_return":        round(np.mean(final_returns), 2),
-        "best_case":          round(np.percentile(final_returns, 95), 2),
-        "worst_case":         round(np.percentile(final_returns, 5), 2),
-        "pct_profitable":     round((final_returns > 0).mean() * 100, 1),
-        "avg_max_drawdown":   round(np.mean(max_drawdowns), 2),
-        "worst_drawdown":     round(np.min(max_drawdowns), 2),
-        "avg_sharpe":         round(np.mean(sharpe_scores), 3) if sharpe_scores else None,
+        "n_simulations":    n_simulations,
+        "sequence_len":     sequence_len,
+        "median_return":    round(float(np.median(final_returns)), 2),
+        "mean_return":      round(float(np.mean(final_returns)), 2),
+        "best_case":        round(float(np.percentile(final_returns, 95)), 2),
+        "worst_case":       round(float(np.percentile(final_returns, 5)), 2),
+        "pct_profitable":   round(float((final_returns > 0).mean() * 100), 1),
+        "avg_max_drawdown": round(float(np.mean(max_drawdowns)), 2),
+        "worst_drawdown":   round(float(np.min(max_drawdowns)), 2),
+        "avg_sharpe":       round(float(np.mean(sharpe_scores)), 3) if sharpe_scores else None,
     }
 
 
 def calibrate_trailing_stop(symbol, days_back=DAYS_BACK):
     """
     Called by research_agent.py for each candidate stock (in parallel).
-
-    Uses WALK-FORWARD validation + SHARPE RATIO to pick optimal stop:
-    - Train: finds candidates on first WALK_FORWARD_TRAIN_DAYS days
-    - Validate: scores each on last WALK_FORWARD_VALIDATE_DAYS days
-    - Picks winner by SHARPE RATIO (risk-adjusted) not just raw avg P&L
-      This prevents picking a stop that won big once but is inconsistent
-    - Also tests ATR-based stop and picks whichever has better Sharpe
-
+    Uses walk-forward validation + Sharpe ratio to pick optimal stop.
     Returns (optimal_pct: float, report: str, best_avg_pnl: float)
     """
     try:
@@ -325,26 +297,27 @@ def calibrate_trailing_stop(symbol, days_back=DAYS_BACK):
         daily_hist = ticker.history(period=f"{days_back}d", interval="1d")
         atr_series = compute_atr(daily_hist) if not daily_hist.empty else None
 
-        # ---- PHASE 1: Find best candidates on training data ----
+        # ---- PHASE 1: Train ----
         train_candidates = []
         for candidate in CALIBRATION_CANDIDATES:
-            results = _run_ticker(symbol, train_hist.copy(), trailing_stop_pct=candidate,
+            results = _run_ticker(symbol, train_hist.copy(),
+                                  trailing_stop_pct=candidate,
                                   grace_period_minutes=GRACE_PERIOD_MINUTES)
             if len(results) < MIN_TRADES_FOR_CALIBRATION:
                 continue
-            pnl_list   = [r["pnl_pct"] for r in results]
-            avg_pnl    = np.mean(pnl_list)
-            sharpe     = compute_sharpe(pnl_list)
+            pnl_list = [r["pnl_pct"] for r in results]
+            avg_pnl  = float(np.mean(pnl_list))
+            sharpe   = compute_sharpe(pnl_list)
             train_candidates.append((candidate, avg_pnl, sharpe))
 
         if not train_candidates:
             return TRAILING_STOP_PCT, f"{symbol}: insufficient trades in training, using default", None
 
-        # ---- PHASE 2: Validate on out-of-sample data using SHARPE as primary metric ----
-        best_fixed_pct    = TRAILING_STOP_PCT
-        best_val_sharpe   = None
-        best_val_pnl      = None
-        validate_lines    = []
+        # ---- PHASE 2: Validate fixed stops by Sharpe ----
+        best_fixed_pct  = TRAILING_STOP_PCT
+        best_val_sharpe = None
+        best_val_pnl    = None
+        validate_lines  = []
 
         for candidate, train_pnl, train_sharpe in train_candidates:
             val_results = _run_ticker(symbol, validate_hist.copy(),
@@ -355,16 +328,15 @@ def calibrate_trailing_stop(symbol, days_back=DAYS_BACK):
                 continue
 
             val_pnl_list = [r["pnl_pct"] for r in val_results]
-            val_avg_pnl  = np.mean(val_pnl_list)
+            val_avg_pnl  = float(np.mean(val_pnl_list))
             val_sharpe   = compute_sharpe(val_pnl_list)
 
             validate_lines.append(
                 f"  {candidate}%: val avg P&L={val_avg_pnl:+.2f}%  "
-                f"val Sharpe={val_sharpe:.3f if val_sharpe else 'N/A'}  "
+                f"val Sharpe={fmt_sharpe(val_sharpe)}  "
                 f"({len(val_results)} trades)"
             )
 
-            # Pick by Sharpe ratio — more consistent is better than lucky avg
             if val_sharpe is not None:
                 if best_val_sharpe is None or val_sharpe > best_val_sharpe:
                     best_val_sharpe = val_sharpe
@@ -374,7 +346,7 @@ def calibrate_trailing_stop(symbol, days_back=DAYS_BACK):
                 best_val_pnl   = val_avg_pnl
                 best_fixed_pct = candidate
 
-        # ---- PHASE 3: Test ATR on validation data ----
+        # ---- PHASE 3: Validate ATR stop ----
         atr_val_sharpe = None
         atr_val_pnl    = None
         avg_atr_stop   = TRAILING_STOP_PCT
@@ -385,12 +357,12 @@ def calibrate_trailing_stop(symbol, days_back=DAYS_BACK):
                                       grace_period_minutes=GRACE_PERIOD_MINUTES,
                                       use_atr=True, atr_series=atr_series)
             if atr_results:
-                atr_pnl_list  = [r["pnl_pct"] for r in atr_results]
-                atr_val_pnl   = np.mean(atr_pnl_list)
+                atr_pnl_list   = [r["pnl_pct"] for r in atr_results]
+                atr_val_pnl    = float(np.mean(atr_pnl_list))
                 atr_val_sharpe = compute_sharpe(atr_pnl_list)
-                avg_atr_stop  = np.mean([r["trailing_stop_used"] for r in atr_results])
+                avg_atr_stop   = float(np.mean([r["trailing_stop_used"] for r in atr_results]))
 
-        # ---- Pick winner: fixed % vs ATR (by Sharpe) ----
+        # ---- Pick winner by Sharpe ----
         use_atr_final = False
         if (atr_val_sharpe is not None and best_val_sharpe is not None
                 and atr_val_sharpe > best_val_sharpe):
@@ -398,14 +370,13 @@ def calibrate_trailing_stop(symbol, days_back=DAYS_BACK):
             final_pnl     = atr_val_pnl
             final_pct     = round(avg_atr_stop, 1)
             final_sharpe  = atr_val_sharpe
-        elif (atr_val_pnl is not None and best_val_pnl is None
-              and atr_val_pnl > 0):
+        elif (atr_val_pnl is not None and best_val_pnl is None and atr_val_pnl > 0):
             use_atr_final = True
             final_pnl     = atr_val_pnl
             final_pct     = round(avg_atr_stop, 1)
             final_sharpe  = atr_val_sharpe
         else:
-            final_pnl    = best_val_pnl or 0.0
+            final_pnl    = best_val_pnl if best_val_pnl is not None else 0.0
             final_pct    = best_fixed_pct
             final_sharpe = best_val_sharpe
 
@@ -419,19 +390,18 @@ def calibrate_trailing_stop(symbol, days_back=DAYS_BACK):
             report_lines.append(
                 f"  ATR-based (avg stop ~{avg_atr_stop:.1f}%): "
                 f"val avg P&L={atr_val_pnl:+.2f}%  "
-                f"val Sharpe={atr_val_sharpe:.3f if atr_val_sharpe else 'N/A'}"
+                f"val Sharpe={fmt_sharpe(atr_val_sharpe)}"
             )
         winner_type = f"ATR-based (~{final_pct}%)" if use_atr_final else f"fixed {final_pct}%"
         report_lines.append(
             f"  → WINNER: {winner_type} | "
             f"validated avg P&L {final_pnl:+.2f}% | "
-            f"Sharpe {final_sharpe:.3f if final_sharpe else 'N/A'}"
+            f"Sharpe {fmt_sharpe(final_sharpe)}"
         )
         report = "\n".join(report_lines)
 
-        sharpe_str = f"{final_sharpe:.3f}" if final_sharpe is not None else "N/A"
         print(f"📐 {symbol} calibrated trailing stop: {final_pct}% "
-              f"(val avg P&L: {final_pnl:+.2f}%, Sharpe: {sharpe_str})")
+              f"(val avg P&L: {final_pnl:+.2f}%, Sharpe: {fmt_sharpe(final_sharpe)})")
         return final_pct, report, final_pnl
 
     except Exception as e:
@@ -496,9 +466,8 @@ def summarize(results, label="FIXED TRAILING STOP"):
     print(f"Best trade             : {df['pnl_pct'].max():.2f}%")
     print(f"Worst trade            : {df['pnl_pct'].min():.2f}%")
 
-    # Sharpe ratio for full backtest
     overall_sharpe = compute_sharpe(df["pnl_pct"].tolist())
-    print(f"Overall Sharpe ratio   : {overall_sharpe:.3f if overall_sharpe else 'N/A'}")
+    print(f"Overall Sharpe ratio   : {fmt_sharpe(overall_sharpe)}")
 
     print("\nExit reason breakdown:")
     print(df["exit_reason"].value_counts())
@@ -511,7 +480,7 @@ def summarize(results, label="FIXED TRAILING STOP"):
         sym_df  = df[df["symbol"] == symbol]
         avg_pnl = sym_df["pnl_pct"].mean()
         sharpe  = compute_sharpe(sym_df["pnl_pct"].tolist())
-        print(f"  {symbol}: avg P&L={avg_pnl:+.2f}%  Sharpe={sharpe:.3f if sharpe else 'N/A'}  "
+        print(f"  {symbol}: avg P&L={avg_pnl:+.2f}%  Sharpe={fmt_sharpe(sharpe)}  "
               f"({len(sym_df)} trades)")
 
     if "held_overnight" in df.columns:
@@ -525,9 +494,9 @@ def summarize(results, label="FIXED TRAILING STOP"):
     if "trailing_stop_used" in df.columns:
         print(f"\nAvg trailing stop used: {df['trailing_stop_used'].mean():.2f}%")
 
-    # Monte Carlo simulation
     print("\n" + "=" * 60)
-    print(f"MONTE CARLO SIMULATION ({MONTE_CARLO_SIMULATIONS} runs, {MONTE_CARLO_SEQUENCE_LEN} trades each)")
+    print(f"MONTE CARLO SIMULATION ({MONTE_CARLO_SIMULATIONS} runs, "
+          f"{MONTE_CARLO_SEQUENCE_LEN} trades each)")
     print("=" * 60)
     mc = run_monte_carlo(df["pnl_pct"].tolist())
     if mc:
@@ -538,7 +507,7 @@ def summarize(results, label="FIXED TRAILING STOP"):
         print(f"% of runs profitable   : {mc['pct_profitable']:.1f}%")
         print(f"Avg max drawdown       : {mc['avg_max_drawdown']:+.2f}%")
         print(f"Worst drawdown seen    : {mc['worst_drawdown']:+.2f}%")
-        print(f"Avg Sharpe across runs : {mc['avg_sharpe']:.3f if mc['avg_sharpe'] else 'N/A'}")
+        print(f"Avg Sharpe across runs : {fmt_sharpe(mc['avg_sharpe'])}")
     else:
         print("Insufficient data for Monte Carlo simulation.")
 
