@@ -19,23 +19,40 @@ ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 MIN_MARKET_CAP = 10_000_000_000
 
 # ---- QUALITY FILTERS ----
-MIN_CONVICTION_SCORE    = 0.25
-MIN_TRAILING_STOP       = 2.5
-EARNINGS_BLOCK_DAYS     = 5
-DOWNTREND_BLOCK_PCT     = 15.0
+MIN_CONVICTION_SCORE = 0.25
+MIN_TRAILING_STOP    = 2.5
+EARNINGS_BLOCK_DAYS  = 5
+DOWNTREND_BLOCK_PCT  = 15.0
 
-# ---- VOLUME CONFIRMATION FILTER ----
-# Research shows mean reversion trades with volume 30%+ above average
-# have 81% win rate vs 61% without — hard requirement
-MIN_VOLUME_RATIO        = 1.3    # must be at least 1.3x average volume
-VOLUME_FILTER_ENABLED   = True   # set False to disable during low-volume days
+# ---- VOLUME CONFIRMATION ----
+MIN_VOLUME_RATIO     = 1.3
+VOLUME_FILTER_ENABLED = True
 
 # ---- SECTOR DIVERSIFICATION ----
-# Never buy more than this many stocks from the same sector
-MAX_SAME_SECTOR         = 1
+MAX_SAME_SECTOR = 1
+
+# ---- UNUSUAL OPTIONS THRESHOLDS ----
+UNUSUAL_OPTIONS_VOLUME_RATIO = 2.0   # call volume > 2x open interest = unusual
+UNUSUAL_OPTIONS_MIN_VOLUME   = 500   # ignore very low volume contracts
+
+# ---- SHORT INTEREST THRESHOLD ----
+HIGH_SHORT_INTEREST_PCT = 10.0  # >10% short float = squeeze potential
+
+# ---- SECTOR ETF MAP for relative strength ----
+SECTOR_ETF_MAP = {
+    "Technology": "XLK",
+    "Finance":    "XLF",
+    "Healthcare": "XLV",
+    "Consumer":   "XLY",
+    "Industrial": "XLI",
+    "Energy":     "XLE",
+    "Cloud":      "IGV",
+    "Automotive": "XLY",
+    "Crypto":     "BITQ",
+    "Unknown":    "SPY",
+}
 
 # ---- HIGH CONVICTION ANCHOR LIST ----
-# Trimmed to top 12 highest conviction names based on backtest results
 HIGH_CONVICTION_ANCHORS = [
     "ARM",   # +2.43%
     "HOOD",  # +2.43%
@@ -51,7 +68,6 @@ HIGH_CONVICTION_ANCHORS = [
     "NOW",   # +1.02%
 ]
 
-# ---- SECTOR MAP for diversification check ----
 SECTOR_MAP = {
     "ARM": "Technology", "NVDA": "Technology", "AMD": "Technology",
     "MSFT": "Technology", "AAPL": "Technology", "GOOGL": "Technology",
@@ -60,12 +76,13 @@ SECTOR_MAP = {
     "MU": "Technology", "SMCI": "Technology", "PLTR": "Technology",
     "HOOD": "Finance", "GS": "Finance", "JPM": "Finance",
     "V": "Finance", "MA": "Finance", "PYPL": "Finance", "COIN": "Finance",
+    "BAC": "Finance", "T": "Finance",
     "UNH": "Healthcare", "JNJ": "Healthcare", "LLY": "Healthcare",
     "SNOW": "Cloud", "DASH": "Consumer", "CAT": "Industrial",
     "TSLA": "Automotive", "RIVN": "Automotive",
     "XOM": "Energy", "CVX": "Energy",
     "AMZN": "Consumer", "WMT": "Consumer", "HD": "Consumer",
-    "MARA": "Crypto", "HOOD": "Finance",
+    "MARA": "Crypto",
 }
 
 FALLBACK_WATCHLIST = [
@@ -175,14 +192,6 @@ def get_vwap(hist):
 
 
 def get_macd(hist):
-    """
-    Calculates MACD (Moving Average Convergence Divergence).
-    MACD line = 12-day EMA - 26-day EMA
-    Signal line = 9-day EMA of MACD
-    Histogram = MACD - Signal
-    Bullish: MACD crosses above signal line (histogram turns positive)
-    Bearish: MACD crosses below signal line (histogram turns negative)
-    """
     try:
         if hist.empty or len(hist) < 30:
             return "N/A", "N/A", "N/A"
@@ -195,9 +204,7 @@ def get_macd(hist):
 
         macd_val    = round(macd_line.iloc[-1], 3)
         signal_val  = round(signal_line.iloc[-1], 3)
-        hist_val    = round(histogram.iloc[-1], 3)
 
-        # Detect crossover in last 2 bars
         prev_hist   = histogram.iloc[-2]
         curr_hist   = histogram.iloc[-1]
         if prev_hist < 0 and curr_hist > 0:
@@ -215,14 +222,6 @@ def get_macd(hist):
 
 
 def get_bollinger_bands(hist, window=20, num_std=2):
-    """
-    Calculates Bollinger Bands.
-    Upper band = SMA + (std * num_std)
-    Lower band = SMA - (std * num_std)
-    Price near upper band = overbought
-    Price near lower band = oversold / potential bounce
-    %B = (price - lower) / (upper - lower) — 0=at lower, 1=at upper, >1=above upper
-    """
     try:
         if hist.empty or len(hist) < window:
             return "N/A", "N/A", "N/A", "N/A"
@@ -237,10 +236,7 @@ def get_bollinger_bands(hist, window=20, num_std=2):
         sma_val    = round(sma.iloc[-1], 2)
 
         band_width = upper_val - lower_val
-        if band_width > 0:
-            pct_b  = round((current - lower_val) / band_width * 100, 1)
-        else:
-            pct_b  = 50.0
+        pct_b      = round((current - lower_val) / band_width * 100, 1) if band_width > 0 else 50.0
 
         if pct_b > 80:
             bb_signal = f"Near upper band ({pct_b}%B) — overbought, caution"
@@ -255,14 +251,6 @@ def get_bollinger_bands(hist, window=20, num_std=2):
 
 
 def get_market_regime():
-    """
-    Detects whether the overall market is trending or range-bound
-    using SPY (S&P 500 ETF) as proxy.
-    Trending up:   SPY above 20-day SMA and 5-day momentum positive
-    Trending down: SPY below 20-day SMA and 5-day momentum negative
-    Range-bound:   SPY near SMA with low momentum
-    Returns regime string passed to GPT-4o to adjust strategy.
-    """
     try:
         spy  = yf.Ticker("SPY")
         hist = spy.history(period="30d")
@@ -273,7 +261,6 @@ def get_market_regime():
         sma20      = close.rolling(window=20).mean().iloc[-1]
         current    = close.iloc[-1]
         momentum5d = ((close.iloc[-1] - close.iloc[-5]) / close.iloc[-5]) * 100
-
         pct_vs_sma = ((current - sma20) / sma20) * 100
 
         if pct_vs_sma > 1.0 and momentum5d > 0.5:
@@ -287,11 +274,6 @@ def get_market_regime():
 
 
 def get_weekly_trend(symbol):
-    """
-    Checks weekly timeframe trend for multi-timeframe confirmation.
-    Returns brief signal: weekly trend direction vs daily.
-    Aligned = stronger signal. Conflicted = use caution.
-    """
     try:
         hist_weekly = yf.Ticker(symbol).history(period="90d", interval="1wk")
         if hist_weekly.empty or len(hist_weekly) < 4:
@@ -311,8 +293,201 @@ def get_weekly_trend(symbol):
         return "Weekly data unavailable"
 
 
+def get_unusual_options(symbol):
+    """
+    Detects unusual call options activity using yfinance options chain.
+    Compares today's call volume to open interest.
+    Volume > 2x open interest on near-term expiry = institutional buying signal.
+    Uses only yfinance — no new API needed.
+    """
+    try:
+        ticker = yf.Ticker(symbol)
+        expirations = ticker.options
+        if not expirations:
+            return "No options data"
+
+        # Check nearest 2 expirations
+        unusual_flags = []
+        for expiry in expirations[:2]:
+            chain = ticker.option_chain(expiry)
+            calls = chain.calls
+
+            if calls.empty:
+                continue
+
+            # Filter for meaningful volume
+            active_calls = calls[calls["volume"] > UNUSUAL_OPTIONS_MIN_VOLUME]
+            if active_calls.empty:
+                continue
+
+            # Check for unusual volume vs open interest
+            for _, row in active_calls.iterrows():
+                vol = row.get("volume", 0) or 0
+                oi  = row.get("openInterest", 0) or 0
+                if oi > 0 and vol / oi >= UNUSUAL_OPTIONS_VOLUME_RATIO:
+                    strike = row.get("strike", "?")
+                    unusual_flags.append(
+                        f"${strike} calls (exp {expiry}): vol={int(vol)}, OI={int(oi)}, "
+                        f"ratio={vol/oi:.1f}x"
+                    )
+
+        if unusual_flags:
+            return f"🔥 UNUSUAL CALL ACTIVITY: {' | '.join(unusual_flags[:2])}"
+        return "No unusual options activity"
+
+    except Exception as e:
+        return f"Options data unavailable ({e})"
+
+
+def get_short_interest(ticker_obj):
+    """
+    Pulls short interest ratio from yfinance.
+    High short interest (>10%) + positive momentum = squeeze potential.
+    """
+    try:
+        info         = ticker_obj.info
+        short_float  = info.get("shortPercentOfFloat", None)
+        short_ratio  = info.get("shortRatio", None)
+
+        if short_float is None:
+            return "Short interest data unavailable"
+
+        short_pct = round(short_float * 100, 1)
+        ratio_str = f", days-to-cover: {short_ratio:.1f}" if short_ratio else ""
+
+        if short_pct >= HIGH_SHORT_INTEREST_PCT:
+            return f"🔥 HIGH SHORT INTEREST: {short_pct}% float shorted{ratio_str} — squeeze potential"
+        elif short_pct >= 5.0:
+            return f"Moderate short interest: {short_pct}% float shorted{ratio_str}"
+        else:
+            return f"Low short interest: {short_pct}% float shorted{ratio_str}"
+    except:
+        return "Short interest data unavailable"
+
+
+# Cache for sector ETF data — pulled once per session, reused for all stocks
+_etf_cache = {}
+
+def get_etf_5d_return(sector_etf):
+    """Pull sector ETF 5-day return, cached so we only fetch each ETF once."""
+    if sector_etf in _etf_cache:
+        return _etf_cache[sector_etf]
+    try:
+        etf_hist = yf.Ticker(sector_etf).history(period="10d")
+        if etf_hist.empty or len(etf_hist) < 6:
+            _etf_cache[sector_etf] = None
+            return None
+        val = ((etf_hist["Close"].iloc[-1] - etf_hist["Close"].iloc[-5]) / etf_hist["Close"].iloc[-5]) * 100
+        _etf_cache[sector_etf] = round(val, 2)
+        return _etf_cache[sector_etf]
+    except:
+        _etf_cache[sector_etf] = None
+        return None
+
+
+def get_relative_strength(symbol, hist):
+    """
+    Compares stock's 5-day return vs its sector ETF.
+    ETF data is cached — only fetched once per ETF per session.
+    """
+    try:
+        if hist.empty or len(hist) < 6:
+            return "Relative strength data unavailable"
+
+        sector     = SECTOR_MAP.get(symbol, "Unknown")
+        sector_etf = SECTOR_ETF_MAP.get(sector, "SPY")
+        stock_5d   = ((hist["Close"].iloc[-1] - hist["Close"].iloc[-5]) / hist["Close"].iloc[-5]) * 100
+        etf_5d     = get_etf_5d_return(sector_etf)
+
+        if etf_5d is None:
+            return f"Sector ETF data unavailable (sector: {sector})"
+
+        rs = round(stock_5d - etf_5d, 2)
+
+        if rs > 1.0:
+            return (f"✅ Outperforming {sector_etf} by {rs:+.2f}% over 5d "
+                    f"(stock: {stock_5d:+.2f}%, sector: {etf_5d:+.2f}%) — relative strength")
+        elif rs < -1.0:
+            return (f"⚠️ Underperforming {sector_etf} by {rs:+.2f}% over 5d "
+                    f"(stock: {stock_5d:+.2f}%, sector: {etf_5d:+.2f}%) — relative weakness")
+        else:
+            return f"In line with {sector_etf} ({rs:+.2f}% vs sector over 5d) — neutral"
+    except Exception as e:
+        return f"Relative strength unavailable ({e})"
+
+
+def get_price_volume_divergence(hist):
+    """
+    Detects price/volume divergence — a key institutional signal.
+    Price rising + volume falling = weak move, likely to reverse (bearish divergence)
+    Price rising + volume rising = institutional accumulation (strong move)
+    Price falling + volume rising = institutional distribution (selling pressure)
+    """
+    try:
+        if hist.empty or len(hist) < 6:
+            return "Price/volume data unavailable"
+
+        price_5d  = hist["Close"].tail(5)
+        volume_5d = hist["Volume"].tail(5)
+
+        price_trend  = price_5d.iloc[-1] - price_5d.iloc[0]
+        volume_trend = volume_5d.mean() - volume_5d.iloc[0]
+
+        price_up   = price_trend > 0
+        volume_up  = volume_trend > 0
+
+        if price_up and volume_up:
+            return "✅ Price up + Volume up — institutional accumulation, strong move"
+        elif price_up and not volume_up:
+            return "⚠️ Price up + Volume down — weak move, possible reversal ahead"
+        elif not price_up and volume_up:
+            return "🔴 Price down + Volume up — institutional distribution, selling pressure"
+        else:
+            return "Price down + Volume down — low conviction move, indecisive"
+    except:
+        return "Price/volume divergence data unavailable"
+
+
+def get_fear_greed():
+    """
+    Fetches CNN Fear & Greed Index.
+    Free public endpoint, no API key needed.
+    0-25 = Extreme Fear (buy signal), 75-100 = Extreme Greed (caution)
+    """
+    try:
+        url      = "https://fear-and-greed-index.p.rapidapi.com/v1/fgi"
+        headers  = {
+            "x-rapidapi-host": "fear-and-greed-index.p.rapidapi.com",
+            "x-rapidapi-key": "SIGN-UP-FOR-KEY"
+        }
+        # Try alternative free endpoint first
+        alt_url  = "https://api.alternative.me/fng/"
+        response = requests.get(alt_url, timeout=5)
+        data     = response.json()
+
+        if "data" in data and len(data["data"]) > 0:
+            value       = int(data["data"][0]["value"])
+            rating      = data["data"][0]["value_classification"]
+
+            if value <= 25:
+                signal = f"🟢 EXTREME FEAR ({value}/100 — {rating}) — historically strong buy signal"
+            elif value <= 45:
+                signal = f"🟡 Fear ({value}/100 — {rating}) — cautious buy opportunity"
+            elif value <= 55:
+                signal = f"⚪ Neutral ({value}/100 — {rating})"
+            elif value <= 75:
+                signal = f"🟡 Greed ({value}/100 — {rating}) — be selective"
+            else:
+                signal = f"🔴 EXTREME GREED ({value}/100 — {rating}) — caution, market may be overextended"
+
+            return signal
+
+        return "Fear & Greed data unavailable"
+    except Exception as e:
+        return f"Fear & Greed unavailable ({e})"
+
+
 def get_sector(symbol):
-    """Returns sector for diversification check."""
     return SECTOR_MAP.get(symbol, "Unknown")
 
 
@@ -440,11 +615,6 @@ def calibrate_watchlist_parallel(watchlist):
 
 
 def apply_sector_diversification(picks, max_same_sector=MAX_SAME_SECTOR):
-    """
-    Given a list of top picks from GPT-4o, enforce sector diversification.
-    Never return more than max_same_sector stocks from the same sector.
-    Returns filtered list.
-    """
     sector_counts = {}
     diversified   = []
     removed       = []
@@ -465,18 +635,14 @@ def apply_sector_diversification(picks, max_same_sector=MAX_SAME_SECTOR):
 
 
 def research_stocks(previously_held=None):
-    """
-    Main research function.
-    previously_held — list of symbols held yesterday that stopped out or hit ceiling.
-                      Used for re-entry logic: if they still pass all filters today,
-                      they get priority consideration.
-    """
     print("🔍 Building blended watchlist (Alpaca screener + top 12 conviction anchors)...")
     watchlist = get_dynamic_watchlist(top_n=20)
 
-    # ---- Market regime detection ----
+    # Market regime + Fear & Greed (run once, used in prompt)
     market_regime = get_market_regime()
+    fear_greed    = get_fear_greed()
     print(f"📊 Market regime: {market_regime}")
+    print(f"😨 Fear & Greed: {fear_greed}")
 
     calibration = calibrate_watchlist_parallel(watchlist)
 
@@ -519,7 +685,6 @@ def research_stocks(previously_held=None):
         if pnl <= 0:
             rejected.append(f"{symbol} (negative P&L: {pnl:+.2f}%)")
             continue
-        # FIX: block exactly 0.00% — walk-forward returning zero means inconclusive
         if pnl == 0.0:
             rejected.append(f"{symbol} (zero conviction score — inconclusive)")
             continue
@@ -535,7 +700,6 @@ def research_stocks(previously_held=None):
     if rejected:
         print(f"🚫 Filtered out: {', '.join(rejected)}")
 
-    # Relax if nothing passes
     if not filtered_watchlist:
         print("⚠️ All stocks filtered out — relaxing conviction threshold, keeping positive P&L only")
         for symbol in post_downtrend_filter:
@@ -596,37 +760,34 @@ def research_stocks(previously_held=None):
             if volume != "N/A" and avg_volume and avg_volume > 0:
                 volume_ratio = round(volume / avg_volume, 2)
 
-            # ---- Volume confirmation filter ----
             volume_flag = ""
             if VOLUME_FILTER_ENABLED and volume_ratio != "N/A":
                 if volume_ratio < MIN_VOLUME_RATIO:
-                    volume_flag = f" ⚠️ LOW VOLUME ({volume_ratio}x avg — below {MIN_VOLUME_RATIO}x threshold)"
+                    volume_flag = f" ⚠️ LOW VOLUME ({volume_ratio}x avg)"
                 else:
                     volume_flag = f" ✅ Volume confirmed ({volume_ratio}x avg)"
 
-            # VWAP
-            vwap, pct_vs_vwap = get_vwap(hist)
-            if pct_vs_vwap != "N/A":
-                vwap_label = (f"VWAP=${vwap} | Price vs VWAP: {pct_vs_vwap:+.2f}% "
-                              f"({'above — bullish' if pct_vs_vwap > 0 else 'below — bearish'})")
-            else:
-                vwap_label = "VWAP: unavailable"
+            # All signals
+            vwap, pct_vs_vwap   = get_vwap(hist)
+            vwap_label          = (f"VWAP=${vwap} | Price vs VWAP: {pct_vs_vwap:+.2f}% "
+                                   f"({'above — bullish' if pct_vs_vwap != 'N/A' and pct_vs_vwap > 0 else 'below — bearish'})"
+                                   if pct_vs_vwap != "N/A" else "VWAP: unavailable")
 
-            # MACD
             macd_val, signal_val, macd_signal = get_macd(hist)
             macd_label = (f"MACD={macd_val} | Signal={signal_val} | {macd_signal}"
                           if macd_val != "N/A" else "MACD: unavailable")
 
-            # Bollinger Bands
             bb_upper, bb_lower, bb_sma, bb_signal = get_bollinger_bands(hist)
             bb_label = (f"Bollinger Bands: Upper=${bb_upper} | SMA=${bb_sma} | Lower=${bb_lower} | {bb_signal}"
                         if bb_upper != "N/A" else "Bollinger Bands: unavailable")
 
-            # Weekly trend (multi-timeframe)
-            weekly_trend = get_weekly_trend(symbol)
+            weekly_trend    = get_weekly_trend(symbol)
+            unusual_options = get_unusual_options(symbol)
+            short_interest  = get_short_interest(ticker)
+            rel_strength    = get_relative_strength(symbol, hist)
+            pv_divergence   = get_price_volume_divergence(hist)
 
-            # Re-entry flag
-            reentry_flag = " 🔄 RE-ENTRY CANDIDATE (passed all filters again)" if symbol in reentry_candidates else ""
+            reentry_flag = " 🔄 RE-ENTRY CANDIDATE" if symbol in reentry_candidates else ""
 
             news     = get_news_sentiment(symbol, name)
             earnings = get_earnings_info(ticker)
@@ -652,12 +813,15 @@ def research_stocks(previously_held=None):
                 f"  {macd_label}\n"
                 f"  {bb_label}\n"
                 f"  Weekly trend: {weekly_trend}\n"
+                f"  Unusual Options: {unusual_options}\n"
+                f"  Short Interest: {short_interest}\n"
+                f"  Relative Strength: {rel_strength}\n"
+                f"  Price/Volume: {pv_divergence}\n"
                 f"  Backtest-calibrated trailing stop: {optimal_stop}% "
                 f"(avg P&L: {pnl_display}, 90-min grace period active after entry)"
             )
             results.append({"symbol": symbol, "summary": summary,
-                            "optimal_stop": optimal_stop,
-                            "volume_ratio": volume_ratio})
+                            "optimal_stop": optimal_stop})
 
         except Exception as e:
             print(f"Error fetching {symbol}: {e}")
@@ -667,43 +831,50 @@ def research_stocks(previously_held=None):
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {"role": "system", "content": f"""You are an expert stock research analyst.
+            {"role": "system", "content": f"""You are an expert stock research analyst with institutional-grade signal access.
 Current market regime: {market_regime}
+Current Fear & Greed Index: {fear_greed}
 
-Analyze stocks using technical indicators, earnings timing, insider activity, and analyst ratings.
-RSI below 30 = oversold (potential buy). RSI above 70 = overbought (avoid).
-High volume ratio = strong institutional interest. Prefer stocks with volume 1.3x+ average.
-Insider buying = very bullish signal.
-Analyst upgrades = momentum catalyst.
+Analyze stocks using all available signals. Signal priority order:
+1. Unusual Options Activity — institutional money moving before price. 🔥 flag = strong buy signal
+2. MACD — 🟢 BULLISH CROSSOVER is the strongest momentum confirmation
+3. Relative Strength vs Sector — stock outperforming its sector = real institutional interest
+4. VWAP — price above VWAP = institutional buying pressure
+5. Short Interest — 🔥 HIGH SHORT INTEREST + positive momentum = squeeze potential
+6. Price/Volume divergence — price up + volume up = strong; price up + volume down = weak
+7. Bollinger Bands — near lower band = oversold bounce; near upper = overbought
+8. Volume confirmation — prefer 1.3x+ average volume
+9. RSI — secondary confirmation only (below 30 = oversold, above 70 = overbought, avoid)
+10. Weekly trend — aligned daily + weekly = stronger signal
+11. Re-entry candidates — passed filters yesterday AND today = extra confirmation
 
-Every stock shown has already passed multiple quality filters:
-- Positive historical avg P&L (above zero, minimum +0.25%)
-- Calibrated trailing stop of at least 2.5% (trending cleanly, not choppy)
-- No earnings within 5 days
-- Not more than 15% below its 30-day high (no falling knives)
+Fear & Greed context:
+- Extreme Fear (0-25): buy quality dips aggressively
+- Fear (25-45): good buying opportunity
+- Neutral (45-55): normal selection
+- Greed (55-75): be selective, require stronger signals
+- Extreme Greed (75-100): very selective, only highest conviction picks
 
-KEY SIGNALS TO WEIGHT (in order of importance):
-1. MACD — bullish crossover is the strongest momentum confirmation signal
-2. VWAP — price above VWAP = institutional buying pressure (bullish)
-3. Bollinger Bands — near lower band = oversold bounce potential; near upper = overbought
-4. Volume confirmation — stocks with volume 1.3x+ average have significantly higher win rates
-5. Weekly trend — prefer stocks where weekly and daily trends are aligned
-6. RSI — secondary signal, use to confirm not to lead
-7. Re-entry candidates — stocks that passed yesterday and pass again today have extra confirmation
+Market regime — regime changes HOW you trade, not WHETHER you trade:
+- TRENDING UP: favor momentum picks, MACD bullish crossover, price above VWAP. Pick all 3 slots.
+- TRENDING DOWN: reduce to 1-2 picks max, require RSI below 50 and price above VWAP.
+- RANGE-BOUND: favor mean reversion — RSI below 40, near Bollinger lower band, above VWAP.
+  Still pick 2-3 stocks. Stocks with strong backtest avg P&L (+1.0%+) and good Sharpe (0.4+)
+  have proven edge even in sideways conditions. DO NOT sit on cash just because it is range-bound.
 
-Market regime adjustment:
-- TRENDING UP: favor momentum picks with MACD bullish crossover and price above VWAP
-- TRENDING DOWN: be very selective, require multiple confirming signals, pick fewer
-- RANGE-BOUND: favor mean reversion (oversold RSI + near Bollinger lower band)
-
-If fewer than 3 look genuinely good today, pick fewer — cash is better than a bad trade.
+IMPORTANT: You MUST pick at least 1 stock unless EVERY candidate has:
+- Negative backtest avg P&L, AND
+- RSI above 70, AND
+- Price below VWAP, AND
+- No unusual options activity
+Only then is sitting on cash acceptable.
 
 Always end your response with EXACTLY this format, no bold, no company names, no periods:
 TOP_PICKS:
 1: TICKER
 2: TICKER
 3: TICKER
-If fewer than 3 qualify today:
+If fewer than 3 qualify:
 TOP_PICKS:
 1: TICKER"""},
             {"role": "user", "content": f"Analyze these stocks and pick the top buy opportunities today:\n{research_data}"}
@@ -723,14 +894,13 @@ TOP_PICKS:
             matches = re.findall(r'\b[A-Z]{2,5}\b', line)
             for match in matches:
                 if match not in ("TOP", "PICKS", "RSI", "CEO", "ETF", "NYSE", "NA",
-                                 "VWAP", "MACD", "SMA", "EMA", "BB"):
+                                 "VWAP", "MACD", "SMA", "EMA", "BB", "OI"):
                     if match not in top_picks:
                         top_picks.append(match)
                         break
             if len(top_picks) >= 3:
                 break
 
-    # Apply sector diversification to final picks
     if top_picks:
         top_picks = apply_sector_diversification(top_picks)
 
