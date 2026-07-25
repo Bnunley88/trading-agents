@@ -1,3 +1,4 @@
+
 """
 Standalone backtester + trailing stop calibrator.
 
