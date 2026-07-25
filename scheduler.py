@@ -4,6 +4,7 @@ import schedule
 import time
 import threading
 import alpaca_trade_api as tradeapi
+import yfinance as yf
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -45,18 +46,21 @@ if ENABLE_OPTIONS:
     from options_agent import buy_call_option
 
 # ---- STATE ----
-todays_symbols        = []
-high_water_marks      = {}
-entry_times           = {}
-trailing_stops        = {}
-consecutive_loss_days = 0
-daily_start_value     = 0.0
-yesterdays_exits      = []
-options_daily_cost    = 0.0
+todays_symbols          = []
+high_water_marks        = {}   # peak price since entry (per symbol) — used for trailing stop
+low_water_marks         = {}   # trough price since entry (per symbol) — used for MAE tracking
+entry_times              = {}   # datetime of entry — used for grace period (reset daily, intraday-only)
+entry_dates              = {}   # date of entry — used for time-limit exit (NOT reset daily, spans the hold)
+trailing_stops            = {}   # calibrated base trailing stop % per symbol (from research_agent/backtest)
+effective_trailing_stops  = {}   # conviction-adjusted trailing stop % actually in force per symbol
+consecutive_loss_days    = 0
+daily_start_value        = 0.0
+yesterdays_exits         = []
+options_daily_cost       = 0.0
 
 # ---- CONSTANTS ----
 HARD_PROFIT_CEILING       = 3.0
-STOP_LOSS_PCT             = 2.0
+STOP_LOSS_PCT             = 3.0   # widened from 2.0 — MAE research: 8/9 stopped trades would've recovered at 2%
 TRAILING_STOP_PCT_DEFAULT = 2.0
 GRACE_PERIOD_MINUTES      = 90
 MAX_POSITIONS             = 3
@@ -66,6 +70,26 @@ MIN_BUYING_POWER          = 1000.0
 DAILY_LOSS_LIMIT_PCT    = 2.0
 COOLOFF_LOSS_DAYS       = 3
 COOLOFF_RISK_MULTIPLIER = 0.5
+
+# ---- TIME-BASED EXITS (new) ----
+TIME_LIMIT_TRADING_DAYS   = 2     # exit if held this many trading days and still under threshold
+TIME_LIMIT_PNL_THRESHOLD  = 0.5   # % P&L below which a stale position gets freed up
+FRIDAY_CLOSE_PNL_THRESHOLD = 0.5  # % P&L below which a position gets closed before the weekend
+
+# ---- VIX / VOLATILITY REGIME (new) ----
+VIX_ELEVATED_THRESHOLD = 25.0   # above this, cut new position sizes
+VIX_EXTREME_THRESHOLD  = 35.0   # above this, sit out new buys entirely
+VIX_RISK_MULTIPLIER    = 0.5
+
+# ---- CONVICTION-BASED TRAILING STOP (new) ----
+# Standard trailing stops ratchet tighter on every new high, which stops trades out on
+# normal noise. Instead: only adjust the stop when intraday signals (VWAP/MACD/momentum,
+# exposed by research_agent.check_signal_confirmation) actually re-confirm or break the thesis.
+# If that function isn't available yet, this degrades safely to the old fixed calibrated stop.
+TRAILING_STOP_LOOSEN_FACTOR  = 1.15   # signals still confirm thesis -> give it a bit more room
+TRAILING_STOP_TIGHTEN_FACTOR = 0.6    # signals deteriorating -> protect gains/limit loss faster
+TRAILING_STOP_MIN_PCT        = 1.0
+TRAILING_STOP_MAX_PCT        = 4.0
 
 # ---- OPTIONS GUARDRAILS ----
 MAX_OPTIONS_BUDGET_PCT = 0.02
@@ -81,6 +105,9 @@ MARKET_CLOSE_MIN   = 45
 # ---- CALIBRATION CACHE ----
 CACHE_FILE    = "calibration_cache.json"
 CACHE_MAX_AGE = timedelta(hours=23)
+
+# ---- MAE/MFE LOG (new — feeds backtest.py's per-stock ceiling/stop calibration) ----
+MAE_MFE_LOG_FILE = "mae_mfe_log.json"
 
 
 def load_calibration_cache():
@@ -110,6 +137,89 @@ def save_calibration_cache(stops_dict):
         print(f"💾 Calibration cache saved ({len(stops_dict)} tickers).")
     except Exception as e:
         print(f"⚠️ Could not save calibration cache: {e}")
+
+
+def log_mae_mfe(symbol, entry_price, low_price, high_price, exit_price, exit_reason):
+    """Append MAE/MFE data for a completed trade. backtest.py reads this to calibrate
+    per-stock stop losses (from MAE) and profit ceilings (from MFE) instead of flat %."""
+    try:
+        try:
+            with open(MAE_MFE_LOG_FILE, "r") as f:
+                log = json.load(f)
+        except Exception:
+            log = []
+
+        mae_pct = ((entry_price - low_price) / entry_price) * 100 if entry_price else 0.0
+        mfe_pct = ((high_price - entry_price) / entry_price) * 100 if entry_price else 0.0
+        pnl_pct = ((exit_price - entry_price) / entry_price) * 100 if entry_price else 0.0
+
+        log.append({
+            "symbol": symbol,
+            "entry_price": entry_price,
+            "low_price": low_price,
+            "high_price": high_price,
+            "exit_price": exit_price,
+            "mae_pct": round(mae_pct, 3),
+            "mfe_pct": round(mfe_pct, 3),
+            "pnl_pct": round(pnl_pct, 3),
+            "exit_reason": exit_reason,
+            "exit_time": datetime.now().isoformat(),
+        })
+
+        with open(MAE_MFE_LOG_FILE, "w") as f:
+            json.dump(log, f, indent=2)
+
+        print(f"📝 MAE/MFE logged for {symbol}: MAE={mae_pct:.2f}% MFE={mfe_pct:.2f}% "
+              f"PnL={pnl_pct:.2f}% (reason: {exit_reason})")
+    except Exception as e:
+        print(f"⚠️ Could not log MAE/MFE for {symbol}: {e}")
+
+
+def get_vix():
+    """Pull current VIX level. Returns None if unavailable (never blocks trading on failure)."""
+    try:
+        vix_data = yf.Ticker("^VIX").history(period="1d")
+        if vix_data.empty:
+            return None
+        return float(vix_data["Close"].iloc[-1])
+    except Exception as e:
+        print(f"⚠️ Could not fetch VIX: {e}")
+        return None
+
+
+def get_signal_confirmation(symbol):
+    """
+    Returns True if intraday signals still confirm the position's thesis (price above VWAP,
+    MACD still bullish, momentum positive), False if they've deteriorated, or None if
+    research_agent doesn't expose this yet. Safe no-op until research_agent.py adds
+    check_signal_confirmation() — trailing stop falls back to the old fixed calibrated % here.
+    """
+    try:
+        from research_agent import check_signal_confirmation
+        return check_signal_confirmation(symbol)
+    except ImportError:
+        return None
+    except Exception as e:
+        print(f"⚠️ Signal confirmation check failed for {symbol}: {e}")
+        return None
+
+
+def count_trading_days_held(symbol):
+    """Weekday count between entry_date and today. Doesn't account for market holidays —
+    close enough for a 2-day threshold."""
+    if symbol not in entry_dates:
+        return 0
+    entry_date = entry_dates[symbol]
+    today = datetime.now().date()
+    if today <= entry_date:
+        return 0
+    days = 0
+    d = entry_date
+    while d < today:
+        d += timedelta(days=1)
+        if d.weekday() < 5:
+            days += 1
+    return days
 
 
 def get_trailing_stop(symbol):
@@ -198,7 +308,8 @@ def sync_positions_from_alpaca():
 # ---- SESSIONS ----
 
 def run_morning_session():
-    global todays_symbols, high_water_marks, trailing_stops, entry_times
+    global todays_symbols, high_water_marks, low_water_marks, trailing_stops
+    global entry_times, entry_dates, effective_trailing_stops
     global daily_start_value, consecutive_loss_days, yesterdays_exits, options_daily_cost
 
     print("\n🌅 MORNING SESSION - 9:35 AM")
@@ -218,11 +329,6 @@ def run_morning_session():
         print(f"⚠️ Could not get account info: {e}")
         daily_start_value = 0.0
         buying_power      = 0.0
-
-    risk_mult = get_risk_multiplier()
-    if consecutive_loss_days > 0:
-        print(f"📉 Consecutive losing days: {consecutive_loss_days} "
-              f"({'COOL-OFF ACTIVE' if consecutive_loss_days >= COOLOFF_LOSS_DAYS else 'watching'})")
 
     try:
         existing_positions = api.list_positions()
@@ -249,6 +355,36 @@ def run_morning_session():
     except Exception as e:
         print(f"⚠️ Could not check positions ({e}), proceeding normally.")
         existing_symbols = []
+
+    # ---- COOL-OFF + VIX RISK SIZING ----
+    if consecutive_loss_days > 0:
+        print(f"📉 Consecutive losing days: {consecutive_loss_days} "
+              f"({'COOL-OFF ACTIVE' if consecutive_loss_days >= COOLOFF_LOSS_DAYS else 'watching'})")
+
+    vix = get_vix()
+    vix_risk_mult = 1.0
+    sit_out_vix   = False
+    if vix is not None:
+        if vix > VIX_EXTREME_THRESHOLD:
+            sit_out_vix = True
+            print(f"🌪️ VIX EXTREME: {vix:.1f} — sitting out new buys entirely today.")
+        elif vix > VIX_ELEVATED_THRESHOLD:
+            vix_risk_mult = VIX_RISK_MULTIPLIER
+            print(f"🌪️ VIX ELEVATED: {vix:.1f} (>{VIX_ELEVATED_THRESHOLD}) — "
+                  f"reducing new position sizes to {VIX_RISK_MULTIPLIER * 100:.0f}%")
+        else:
+            print(f"🌪️ VIX: {vix:.1f} (normal range)")
+    else:
+        print("🌪️ VIX: unavailable — proceeding without volatility adjustment")
+
+    if sit_out_vix:
+        todays_symbols = existing_symbols
+        for symbol in todays_symbols:
+            check_position(symbol)
+        print("\n✅ MORNING SESSION COMPLETE (no new buys — VIX extreme)")
+        return
+
+    risk_mult = get_risk_multiplier() * vix_risk_mult
 
     cached = load_calibration_cache()
     if cached:
@@ -306,6 +442,7 @@ def run_morning_session():
     now = datetime.now()
     for symbol in new_symbols:
         entry_times[symbol] = now
+        entry_dates[symbol] = now.date()
 
     # Options layer — only runs when ENABLE_OPTIONS = True
     if ENABLE_OPTIONS and new_symbols:
@@ -327,6 +464,14 @@ def run_morning_session():
 
     time.sleep(3)
     sync_positions_from_alpaca()
+
+    print("\n🔍 STEP 3b: VERIFYING FILLS...")
+    for symbol in new_symbols:
+        if position_exists_in_alpaca(symbol):
+            print(f"✅ Confirmed: {symbol} position exists in Alpaca")
+        else:
+            print(f"❌ WARNING: {symbol} order submitted but no position found in Alpaca "
+                  f"— possible fill failure, check Alpaca dashboard")
 
     print("\n👁️ STEP 4: MONITORING POSITIONS...")
     for symbol in todays_symbols:
@@ -355,7 +500,7 @@ def run_intraday_check():
 
 
 def run_closing_check():
-    global todays_symbols, high_water_marks, trailing_stops, entry_times
+    global todays_symbols, high_water_marks, entry_times
     global consecutive_loss_days, daily_start_value, yesterdays_exits
 
     sync_positions_from_alpaca()
@@ -364,8 +509,9 @@ def run_closing_check():
     print("=" * 50)
 
     if todays_symbols:
+        # at_close=True activates the Friday-close rule below
         for symbol in list(todays_symbols):
-            check_position(symbol)
+            check_position(symbol, at_close=True)
     else:
         print("⚠️ No positions to monitor at close.")
 
@@ -376,6 +522,9 @@ def run_closing_check():
 
     print(f"🔄 Re-entry candidates saved for tomorrow: {yesterdays_exits}")
 
+    # NOTE: entry_dates / low_water_marks / effective_trailing_stops are intentionally
+    # NOT reset here — they need to persist across days for the time-limit exit and
+    # MAE tracking to work on multi-day holds. Only intraday-only state resets.
     todays_symbols   = []
     high_water_marks = {}
     entry_times      = {}
@@ -407,8 +556,9 @@ def _update_loss_streak():
         print(f"⚠️ Could not update loss streak: {e}")
 
 
-def check_position(symbol):
-    global high_water_marks, todays_symbols, trailing_stops, entry_times, yesterdays_exits
+def check_position(symbol, at_close=False):
+    global high_water_marks, low_water_marks, todays_symbols, trailing_stops
+    global effective_trailing_stops, entry_times, entry_dates, yesterdays_exits
 
     position = monitor_position(symbol)
     if not position:
@@ -421,16 +571,34 @@ def check_position(symbol):
 
     if symbol not in high_water_marks or current_price > high_water_marks[symbol]:
         high_water_marks[symbol] = current_price
+    if symbol not in low_water_marks or current_price < low_water_marks[symbol]:
+        low_water_marks[symbol] = current_price
 
-    peak_price         = high_water_marks[symbol]
-    drop_from_peak_pct = ((current_price - peak_price) / peak_price) * 100
-    trailing_stop_pct  = get_trailing_stop(symbol)
-    grace_active       = is_in_grace_period(symbol)
+    peak_price          = high_water_marks[symbol]
+    drop_from_peak_pct  = ((current_price - peak_price) / peak_price) * 100
+    grace_active        = is_in_grace_period(symbol)
+
+    # ---- CONVICTION-BASED TRAILING STOP ----
+    # Only tighten/loosen when intraday signals actually re-confirm or break the thesis —
+    # not on every price wiggle. Falls back to the fixed calibrated stop if
+    # research_agent.check_signal_confirmation isn't available yet.
+    base_stop_pct = get_trailing_stop(symbol)
+    confirmation  = get_signal_confirmation(symbol)
+    if confirmation is True:
+        trailing_stop_pct = min(base_stop_pct * TRAILING_STOP_LOOSEN_FACTOR, TRAILING_STOP_MAX_PCT)
+        conviction_label = " [signals CONFIRM — stop loosened]"
+    elif confirmation is False:
+        trailing_stop_pct = max(base_stop_pct * TRAILING_STOP_TIGHTEN_FACTOR, TRAILING_STOP_MIN_PCT)
+        conviction_label = " [signals DETERIORATING — stop tightened]"
+    else:
+        trailing_stop_pct = base_stop_pct
+        conviction_label = ""
+    effective_trailing_stops[symbol] = trailing_stop_pct
 
     grace_label = f" [GRACE {GRACE_PERIOD_MINUTES}min active]" if grace_active else ""
     print(f"📈 {symbol} | Current: ${current_price:.2f} | Entry: ${entry_price:.2f} | Peak: ${peak_price:.2f}")
     print(f"   P&L: {pnl:.2f}% | Drop from peak: {drop_from_peak_pct:.2f}% | "
-          f"Trailing stop: {trailing_stop_pct}%{grace_label}")
+          f"Trailing stop: {trailing_stop_pct:.2f}%{conviction_label}{grace_label}")
 
     def _exit(reason_label):
         if not position_exists_in_alpaca(symbol):
@@ -438,11 +606,23 @@ def check_position(symbol):
         else:
             exit_trade(symbol)
 
+        log_mae_mfe(
+            symbol=symbol,
+            entry_price=entry_price,
+            low_price=low_water_marks.get(symbol, entry_price),
+            high_price=peak_price,
+            exit_price=current_price,
+            exit_reason=reason_label,
+        )
+
         if symbol in todays_symbols:
             todays_symbols.remove(symbol)
         trailing_stops.pop(symbol, None)
+        effective_trailing_stops.pop(symbol, None)
         entry_times.pop(symbol, None)
+        entry_dates.pop(symbol, None)
         high_water_marks.pop(symbol, None)
+        low_water_marks.pop(symbol, None)
 
         if symbol not in yesterdays_exits:
             yesterdays_exits.append(symbol)
@@ -457,12 +637,25 @@ def check_position(symbol):
         _exit("STOP_LOSS")
         return
 
+    trading_days_held = count_trading_days_held(symbol)
+    if trading_days_held >= TIME_LIMIT_TRADING_DAYS and pnl < TIME_LIMIT_PNL_THRESHOLD:
+        print(f"⏱️ TIME LIMIT HIT! {symbol} held {trading_days_held} trading days at "
+              f"{pnl:.2f}% P&L (threshold: {TIME_LIMIT_PNL_THRESHOLD}%) — freeing up capital")
+        _exit("TIME_LIMIT")
+        return
+
+    if at_close and datetime.now().weekday() == 4 and pnl < FRIDAY_CLOSE_PNL_THRESHOLD:
+        print(f"📅 FRIDAY CLOSE RULE! {symbol} at {pnl:.2f}% P&L "
+              f"(<{FRIDAY_CLOSE_PNL_THRESHOLD}%) — exiting before weekend gap risk")
+        _exit("FRIDAY_CLOSE")
+        return
+
     if (not grace_active
             and peak_price > entry_price
             and drop_from_peak_pct <= -trailing_stop_pct):
         print(f"🛡️ TRAILING STOP TRIGGERED! {symbol} locked in {pnl:.2f}% "
               f"(down {abs(drop_from_peak_pct):.2f}% from peak ${peak_price:.2f}, "
-              f"stop was {trailing_stop_pct}%)")
+              f"stop was {trailing_stop_pct:.2f}%)")
         _exit("TRAILING_STOP")
         return
 
@@ -479,13 +672,18 @@ for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
 schedule.every(5).minutes.do(run_intraday_check)
 
 print("⏰ SCHEDULER RUNNING")
-print("🌅 Morning session: 9:35 AM (calibration loaded from cache if fresh)")
+print("🌅 Morning session: 9:35 AM (calibration loaded from cache if fresh, VIX-adjusted sizing)")
 print("🔄 Intraday checks: every 5 min during market hours (silent when no positions)")
-print("🌆 Closing check: 3:45 PM (saves calibration cache for tomorrow)")
-print(f"🛡️  Stop Loss: -{STOP_LOSS_PCT}% (always active)")
+print("🌆 Closing check: 3:45 PM (saves calibration cache, applies Friday-close rule)")
+print(f"🛡️  Stop Loss: -{STOP_LOSS_PCT}% (widened from 2% per MAE research, always active)")
 print(f"⏸️  Grace period: {GRACE_PERIOD_MINUTES} min after entry (trailing stop suppressed)")
-print(f"📉 Trailing Stop: per-stock calibrated (default fallback: {TRAILING_STOP_PCT_DEFAULT}%)")
+print(f"📉 Trailing Stop: per-stock calibrated, conviction-adjusted "
+      f"(default fallback: {TRAILING_STOP_PCT_DEFAULT}%)")
 print(f"💰 Hard Profit Ceiling: +{HARD_PROFIT_CEILING}%")
+print(f"⏱️  Time limit: {TIME_LIMIT_TRADING_DAYS}+ trading days under {TIME_LIMIT_PNL_THRESHOLD}% P&L -> exit")
+print(f"📅 Friday close rule: under {FRIDAY_CLOSE_PNL_THRESHOLD}% P&L at Friday close -> exit")
+print(f"🌪️  VIX check: >{VIX_ELEVATED_THRESHOLD} reduces size to {VIX_RISK_MULTIPLIER*100:.0f}%, "
+      f">{VIX_EXTREME_THRESHOLD} sits out entirely")
 print(f"🛑 Daily loss limit: -{DAILY_LOSS_LIMIT_PCT}% (pauses new trades if hit)")
 print(f"❄️  Cool-off: after {COOLOFF_LOSS_DAYS} consecutive losing days (position sizes at 50%)")
 print(f"📈 Options trading: {'ENABLED' if ENABLE_OPTIONS else 'DISABLED (flip ENABLE_OPTIONS to True when ready)'}")
