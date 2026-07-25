@@ -472,7 +472,8 @@ def run_morning_session():
                       f"(max {MAX_OPTIONS_CONTRACTS} contract, "
                       f"budget cap: {MAX_OPTIONS_BUDGET_PCT*100:.0f}% of portfolio)...")
                 result = buy_call_option(top_pick, portfolio_value,
-                                         max_contracts=MAX_OPTIONS_CONTRACTS)
+                                         max_contracts=MAX_OPTIONS_CONTRACTS,
+                                         conviction_score=conviction_scores.get(top_pick))
                 if result:
                     options_daily_cost += portfolio_value * MAX_OPTIONS_BUDGET_PCT
         except Exception as e:
