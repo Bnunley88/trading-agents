@@ -31,6 +31,10 @@ DOWNTREND_BLOCK_PCT  = 15.0
 # Until then this filter is a safe no-op (sharpe reads as None and is skipped).
 MIN_SHARPE = 0.3
 
+# Fallback profit ceiling when calibration doesn't return one — matches scheduler.py's
+# HARD_PROFIT_CEILING fallback, keep these in sync if you change either.
+DEFAULT_PROFIT_CEILING = 3.0
+
 # ---- VOLUME CONFIRMATION ----
 MIN_VOLUME_RATIO     = 1.3
 VOLUME_FILTER_ENABLED = True
@@ -670,14 +674,17 @@ def get_finnhub_data(symbol):
 
 
 def unpack_calibration(calibration, symbol):
-    """calibration[symbol] is (optimal_pct, report, best_avg_pnl) today. Once backtest.py
-    is upgraded to also return Sharpe, it'll be a 4-tuple (optimal_pct, report,
-    best_avg_pnl, sharpe). This handles both so MIN_SHARPE/alpha-decay degrade safely
-    (sharpe=None, filters skipped) until that upgrade lands."""
+    """backtest.py's calibrate_trailing_stop() returns
+    (optimal_pct, report, best_avg_pnl, sharpe, profit_ceiling). Reads defensively by
+    position so shorter/older tuples still work (missing sharpe -> None, missing
+    profit_ceiling -> DEFAULT_PROFIT_CEILING) instead of crashing on length."""
     entry = calibration.get(symbol, (TRAILING_STOP_PCT, "", None))
-    if len(entry) >= 4:
-        return entry[0], entry[1], entry[2], entry[3]
-    return entry[0], entry[1], entry[2], None
+    optimal_pct    = entry[0] if len(entry) > 0 else TRAILING_STOP_PCT
+    report         = entry[1] if len(entry) > 1 else ""
+    best_avg_pnl   = entry[2] if len(entry) > 2 else None
+    sharpe         = entry[3] if len(entry) > 3 else None
+    profit_ceiling = entry[4] if len(entry) > 4 else DEFAULT_PROFIT_CEILING
+    return optimal_pct, report, best_avg_pnl, sharpe, profit_ceiling
 
 
 def load_alpha_decay_log():
@@ -831,7 +838,7 @@ def research_stocks(previously_held=None):
     filtered_watchlist = []
     rejected           = []
     for symbol in post_downtrend_filter:
-        optimal_stop, _, best_avg_pnl, sharpe = unpack_calibration(calibration, symbol)
+        optimal_stop, _, best_avg_pnl, sharpe, _ = unpack_calibration(calibration, symbol)
         pnl = float(best_avg_pnl) if best_avg_pnl is not None else None
 
         if pnl is None:
@@ -861,7 +868,7 @@ def research_stocks(previously_held=None):
     if not filtered_watchlist:
         print("⚠️ All stocks filtered out — relaxing conviction threshold, keeping positive P&L only")
         for symbol in post_downtrend_filter:
-            _, _, best_avg_pnl, _ = unpack_calibration(calibration, symbol)
+            _, _, best_avg_pnl, _, _ = unpack_calibration(calibration, symbol)
             pnl = float(best_avg_pnl) if best_avg_pnl is not None else None
             if pnl is None or pnl > 0:
                 filtered_watchlist.append(symbol)
@@ -934,7 +941,7 @@ def research_stocks(previously_held=None):
 
             rel_strength = get_relative_strength(symbol, hist)
 
-            optimal_stop, _, best_avg_pnl, sharpe = unpack_calibration(calibration, symbol)
+            optimal_stop, _, best_avg_pnl, sharpe, profit_ceiling = unpack_calibration(calibration, symbol)
             pnl_display    = f"{float(best_avg_pnl):+.2f}%" if best_avg_pnl is not None else "N/A"
             sharpe_display = f"{sharpe:.2f}" if sharpe is not None else "N/A"
 
@@ -976,8 +983,8 @@ def research_stocks(previously_held=None):
                 f"  {momentum_label}",
                 f"  Short Interest: {short_interest}",
                 f"  Price/Volume: {pv_divergence}",
-                f"  Backtest-calibrated: trailing stop {optimal_stop}%, avg P&L {pnl_display}, "
-                f"Sharpe {sharpe_display} (90-min grace period active after entry)",
+                f"  Backtest-calibrated: trailing stop {optimal_stop}%, profit ceiling {profit_ceiling}%, "
+                f"avg P&L {pnl_display}, Sharpe {sharpe_display} (90-min grace period active after entry)",
             ]
             if decay_flag:
                 summary_lines.append(f"  {decay_flag}")
@@ -1086,22 +1093,26 @@ TOP_PICKS:
         }
 
     trailing_stops    = {}
+    profit_ceilings   = {}
     conviction_scores = {}
     for symbol in top_picks:
-        optimal, _, best_avg_pnl, _ = unpack_calibration(calibration, symbol)
+        optimal, _, best_avg_pnl, _, ceiling = unpack_calibration(calibration, symbol)
         trailing_stops[symbol]    = optimal
+        profit_ceilings[symbol]   = ceiling
         conviction_scores[symbol] = float(best_avg_pnl) if best_avg_pnl is not None else 0.0
 
     print("RESEARCH AGENT REPORT:")
     print(recommendation)
     print(f"\nTOP PICKS TODAY: {top_picks}")
     print(f"📐 Calibrated trailing stops : {trailing_stops}")
+    print(f"💰 Calibrated profit ceilings: {profit_ceilings}")
     print(f"🎯 Conviction scores         : {conviction_scores}")
 
     return {
         "report":            recommendation,
         "symbols":           top_picks,
         "trailing_stops":    trailing_stops,
+        "profit_ceilings":   profit_ceilings,
         "conviction_scores": conviction_scores
     }
 
