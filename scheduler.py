@@ -53,13 +53,14 @@ entry_times              = {}   # datetime of entry — used for grace period (r
 entry_dates              = {}   # date of entry — used for time-limit exit (NOT reset daily, spans the hold)
 trailing_stops            = {}   # calibrated base trailing stop % per symbol (from research_agent/backtest)
 effective_trailing_stops  = {}   # conviction-adjusted trailing stop % actually in force per symbol
+profit_ceilings           = {}   # per-stock MFE-based profit ceiling % (from research_agent/backtest)
 consecutive_loss_days    = 0
 daily_start_value        = 0.0
 yesterdays_exits         = []
 options_daily_cost       = 0.0
 
 # ---- CONSTANTS ----
-HARD_PROFIT_CEILING       = 3.0
+HARD_PROFIT_CEILING       = 3.0   # fallback used when a symbol has no calibrated profit_ceiling yet
 STOP_LOSS_PCT             = 3.0   # widened from 2.0 — MAE research: 8/9 stopped trades would've recovered at 2%
 TRAILING_STOP_PCT_DEFAULT = 2.0
 GRACE_PERIOD_MINUTES      = 90
@@ -111,26 +112,30 @@ MAE_MFE_LOG_FILE = "mae_mfe_log.json"
 
 
 def load_calibration_cache():
+    """Returns (trailing_stops_dict, profit_ceilings_dict). Old cache files won't have
+    a 'profit_ceilings' key — .get() with a default handles that safely."""
     try:
         with open(CACHE_FILE, "r") as f:
             data = json.load(f)
         saved_at = datetime.fromisoformat(data["saved_at"])
         if datetime.now() - saved_at > CACHE_MAX_AGE:
             print("📐 Calibration cache is stale — will recompute.")
-            return {}
-        stops = data["trailing_stops"]
+            return {}, {}
+        stops    = data["trailing_stops"]
+        ceilings = data.get("profit_ceilings", {})
         print(f"📐 Loaded calibration cache from {saved_at.strftime('%Y-%m-%d %H:%M')} "
               f"({len(stops)} tickers)")
-        return stops
+        return stops, ceilings
     except Exception:
-        return {}
+        return {}, {}
 
 
-def save_calibration_cache(stops_dict):
+def save_calibration_cache(stops_dict, ceilings_dict):
     try:
         data = {
             "saved_at": datetime.now().isoformat(),
-            "trailing_stops": stops_dict
+            "trailing_stops": stops_dict,
+            "profit_ceilings": ceilings_dict
         }
         with open(CACHE_FILE, "w") as f:
             json.dump(data, f, indent=2)
@@ -226,6 +231,10 @@ def get_trailing_stop(symbol):
     return trailing_stops.get(symbol, TRAILING_STOP_PCT_DEFAULT)
 
 
+def get_profit_ceiling(symbol):
+    return profit_ceilings.get(symbol, HARD_PROFIT_CEILING)
+
+
 def is_in_grace_period(symbol):
     if symbol not in entry_times:
         return False
@@ -309,7 +318,7 @@ def sync_positions_from_alpaca():
 
 def run_morning_session():
     global todays_symbols, high_water_marks, low_water_marks, trailing_stops
-    global entry_times, entry_dates, effective_trailing_stops
+    global entry_times, entry_dates, effective_trailing_stops, profit_ceilings
     global daily_start_value, consecutive_loss_days, yesterdays_exits, options_daily_cost
 
     print("\n🌅 MORNING SESSION - 9:35 AM")
@@ -386,10 +395,13 @@ def run_morning_session():
 
     risk_mult = get_risk_multiplier() * vix_risk_mult
 
-    cached = load_calibration_cache()
-    if cached:
-        trailing_stops.update(cached)
+    cached_stops, cached_ceilings = load_calibration_cache()
+    if cached_stops:
+        trailing_stops.update(cached_stops)
         print(f"📐 Using cached trailing stops: {trailing_stops}")
+    if cached_ceilings:
+        profit_ceilings.update(cached_ceilings)
+        print(f"📐 Using cached profit ceilings: {profit_ceilings}")
 
     print("\n📊 STEP 1: RESEARCHING STOCKS + CALIBRATING TRAILING STOPS...")
     research_result = research_stocks(previously_held=yesterdays_exits)
@@ -399,6 +411,10 @@ def run_morning_session():
 
     trailing_stops.update(new_stops)
     print(f"📐 Active trailing stops: {trailing_stops}")
+
+    new_ceilings = research_result.get("profit_ceilings", {})
+    profit_ceilings.update(new_ceilings)
+    print(f"📐 Active profit ceilings: {profit_ceilings}")
 
     if not top_symbols:
         print("🛑 No quality picks today — sitting on cash, monitoring existing positions only.")
@@ -518,7 +534,7 @@ def run_closing_check():
     _update_loss_streak()
 
     if trailing_stops:
-        save_calibration_cache(trailing_stops)
+        save_calibration_cache(trailing_stops, profit_ceilings)
 
     print(f"🔄 Re-entry candidates saved for tomorrow: {yesterdays_exits}")
 
@@ -558,7 +574,7 @@ def _update_loss_streak():
 
 def check_position(symbol, at_close=False):
     global high_water_marks, low_water_marks, todays_symbols, trailing_stops
-    global effective_trailing_stops, entry_times, entry_dates, yesterdays_exits
+    global effective_trailing_stops, entry_times, entry_dates, yesterdays_exits, profit_ceilings
 
     position = monitor_position(symbol)
     if not position:
@@ -595,10 +611,13 @@ def check_position(symbol, at_close=False):
         conviction_label = ""
     effective_trailing_stops[symbol] = trailing_stop_pct
 
+    profit_ceiling = get_profit_ceiling(symbol)
+
     grace_label = f" [GRACE {GRACE_PERIOD_MINUTES}min active]" if grace_active else ""
     print(f"📈 {symbol} | Current: ${current_price:.2f} | Entry: ${entry_price:.2f} | Peak: ${peak_price:.2f}")
     print(f"   P&L: {pnl:.2f}% | Drop from peak: {drop_from_peak_pct:.2f}% | "
-          f"Trailing stop: {trailing_stop_pct:.2f}%{conviction_label}{grace_label}")
+          f"Trailing stop: {trailing_stop_pct:.2f}% | Profit ceiling: {profit_ceiling:.2f}%"
+          f"{conviction_label}{grace_label}")
 
     def _exit(reason_label):
         if not position_exists_in_alpaca(symbol):
@@ -619,6 +638,7 @@ def check_position(symbol, at_close=False):
             todays_symbols.remove(symbol)
         trailing_stops.pop(symbol, None)
         effective_trailing_stops.pop(symbol, None)
+        profit_ceilings.pop(symbol, None)
         entry_times.pop(symbol, None)
         entry_dates.pop(symbol, None)
         high_water_marks.pop(symbol, None)
@@ -627,8 +647,8 @@ def check_position(symbol, at_close=False):
         if symbol not in yesterdays_exits:
             yesterdays_exits.append(symbol)
 
-    if pnl >= HARD_PROFIT_CEILING:
-        print(f"💰 HARD PROFIT CEILING HIT! {symbol} +{pnl:.2f}%")
+    if pnl >= profit_ceiling:
+        print(f"💰 PROFIT CEILING HIT! {symbol} +{pnl:.2f}% (ceiling: {profit_ceiling:.2f}%)")
         _exit("HARD_CEILING")
         return
 
@@ -679,7 +699,7 @@ print(f"🛡️  Stop Loss: -{STOP_LOSS_PCT}% (widened from 2% per MAE research,
 print(f"⏸️  Grace period: {GRACE_PERIOD_MINUTES} min after entry (trailing stop suppressed)")
 print(f"📉 Trailing Stop: per-stock calibrated, conviction-adjusted "
       f"(default fallback: {TRAILING_STOP_PCT_DEFAULT}%)")
-print(f"💰 Hard Profit Ceiling: +{HARD_PROFIT_CEILING}%")
+print(f"💰 Profit Ceiling: per-stock calibrated from MFE (fallback: +{HARD_PROFIT_CEILING}%)")
 print(f"⏱️  Time limit: {TIME_LIMIT_TRADING_DAYS}+ trading days under {TIME_LIMIT_PNL_THRESHOLD}% P&L -> exit")
 print(f"📅 Friday close rule: under {FRIDAY_CLOSE_PNL_THRESHOLD}% P&L at Friday close -> exit")
 print(f"🌪️  VIX check: >{VIX_ELEVATED_THRESHOLD} reduces size to {VIX_RISK_MULTIPLIER*100:.0f}%, "
