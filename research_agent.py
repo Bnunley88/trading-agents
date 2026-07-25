@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import yfinance as yf
 import requests
 from openai import OpenAI
@@ -19,10 +20,16 @@ ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 MIN_MARKET_CAP = 10_000_000_000
 
 # ---- QUALITY FILTERS ----
-MIN_CONVICTION_SCORE = 0.25
+MIN_CONVICTION_SCORE = 0.5   # raised back from 0.25 now that the backtest f-string bug is fixed
 MIN_TRAILING_STOP    = 2.5
 EARNINGS_BLOCK_DAYS  = 5
 DOWNTREND_BLOCK_PCT  = 15.0
+
+# MIN_SHARPE is a hard filter, not just a ranking input: stocks need positive avg P&L
+# AND a consistent Sharpe to pass. NOTE: this only takes effect once backtest.py's
+# calibrate_trailing_stop() returns a 4th value (sharpe) — see unpack_calibration() below.
+# Until then this filter is a safe no-op (sharpe reads as None and is skipped).
+MIN_SHARPE = 0.3
 
 # ---- VOLUME CONFIRMATION ----
 MIN_VOLUME_RATIO     = 1.3
@@ -31,12 +38,28 @@ VOLUME_FILTER_ENABLED = True
 # ---- SECTOR DIVERSIFICATION ----
 MAX_SAME_SECTOR = 1
 
-# ---- UNUSUAL OPTIONS THRESHOLDS ----
+# ---- UNUSUAL OPTIONS THRESHOLDS (function kept, no longer called — see feature reduction below) ----
 UNUSUAL_OPTIONS_VOLUME_RATIO = 2.0   # call volume > 2x open interest = unusual
 UNUSUAL_OPTIONS_MIN_VOLUME   = 500   # ignore very low volume contracts
 
 # ---- SHORT INTEREST THRESHOLD ----
 HIGH_SHORT_INTEREST_PCT = 10.0  # >10% short float = squeeze potential
+
+# ---- MULTI-TIMEFRAME MOMENTUM (replaces single 5-day momentum) ----
+# Same weighted 1m+3m+6m pattern as the #1 QuantConnect Dual Momentum strategy (Sharpe 5.02).
+MOMENTUM_LOOKBACK_1M = 21   # ~1 trading month
+MOMENTUM_LOOKBACK_3M = 63   # ~3 trading months
+MOMENTUM_LOOKBACK_6M = 126  # ~6 trading months
+MOMENTUM_WEIGHT_1M   = 1.0
+MOMENTUM_WEIGHT_3M   = 1.0
+MOMENTUM_WEIGHT_6M   = 1.0
+
+# ---- NQ FUTURES PRE-MARKET CHECK ----
+NQ_STRONG_NEGATIVE_PCT = -0.5   # below this, treat as a strongly negative leading indicator
+
+# ---- ALPHA DECAY MONITORING ----
+ALPHA_DECAY_LOG_FILE       = "alpha_decay_log.json"
+ALPHA_DECAY_DROP_THRESHOLD = 0.3   # Sharpe drop vs ~1wk ago that counts as meaningful decay
 
 # ---- SECTOR ETF MAP for relative strength ----
 SECTOR_ETF_MAP = {
@@ -221,6 +244,11 @@ def get_macd(hist):
         return "N/A", "N/A", "N/A"
 
 
+# ---- DISABLED (feature reduction, July 2026 upgrade session) ----
+# QuantConnect research: going from 6 to 16 signals reduced information gain from 0.107
+# to 0.023 — more features added overfitting risk, not accuracy. Bollinger Bands, weekly
+# trend, and unusual options were identified as the noisiest of the extra signals.
+# Kept here (unused) in case you want to re-enable any of them later.
 def get_bollinger_bands(hist, window=20, num_std=2):
     try:
         if hist.empty or len(hist) < window:
@@ -251,28 +279,38 @@ def get_bollinger_bands(hist, window=20, num_std=2):
 
 
 def get_market_regime():
+    """VWAP is now the primary regime signal (weighted above SMA), per r/algotrading
+    research: 'VWAP is the most heavily weighted factor' for regime detection."""
     try:
         spy  = yf.Ticker("SPY")
         hist = spy.history(period="30d")
         if hist.empty or len(hist) < 20:
             return "Unknown"
 
-        close      = hist["Close"]
-        sma20      = close.rolling(window=20).mean().iloc[-1]
-        current    = close.iloc[-1]
-        momentum5d = ((close.iloc[-1] - close.iloc[-5]) / close.iloc[-5]) * 100
-        pct_vs_sma = ((current - sma20) / sma20) * 100
+        close       = hist["Close"]
+        sma20       = close.rolling(window=20).mean().iloc[-1]
+        current     = close.iloc[-1]
+        momentum5d  = ((close.iloc[-1] - close.iloc[-5]) / close.iloc[-5]) * 100
+        pct_vs_sma  = ((current - sma20) / sma20) * 100
+        _, pct_vs_vwap = get_vwap(hist)
 
-        if pct_vs_sma > 1.0 and momentum5d > 0.5:
-            return f"TRENDING UP (SPY {pct_vs_sma:+.1f}% above 20d SMA, +{momentum5d:.1f}% 5d momentum) — favor momentum picks"
-        elif pct_vs_sma < -1.0 and momentum5d < -0.5:
-            return f"TRENDING DOWN (SPY {pct_vs_sma:+.1f}% below 20d SMA, {momentum5d:.1f}% 5d momentum) — be selective, reduce exposure"
+        # Fall back to SMA if VWAP is unavailable for some reason
+        primary_signal = pct_vs_vwap if pct_vs_vwap != "N/A" else pct_vs_sma
+
+        if primary_signal > 0.5 and momentum5d > 0:
+            return (f"TRENDING UP (SPY {primary_signal:+.2f}% vs VWAP, {pct_vs_sma:+.1f}% vs 20d SMA, "
+                    f"+{momentum5d:.1f}% 5d momentum) — favor momentum picks")
+        elif primary_signal < -0.5 and momentum5d < 0:
+            return (f"TRENDING DOWN (SPY {primary_signal:+.2f}% vs VWAP, {pct_vs_sma:+.1f}% vs 20d SMA, "
+                    f"{momentum5d:.1f}% 5d momentum) — be selective, reduce exposure")
         else:
-            return f"RANGE-BOUND (SPY {pct_vs_sma:+.1f}% vs 20d SMA, {momentum5d:.1f}% 5d momentum) — favor mean reversion picks"
+            return (f"RANGE-BOUND (SPY {primary_signal:+.2f}% vs VWAP, {pct_vs_sma:+.1f}% vs 20d SMA, "
+                    f"{momentum5d:.1f}% 5d momentum) — favor mean reversion picks")
     except:
         return "Unknown"
 
 
+# ---- DISABLED (feature reduction, July 2026 upgrade session) — see note above get_bollinger_bands ----
 def get_weekly_trend(symbol):
     try:
         hist_weekly = yf.Ticker(symbol).history(period="90d", interval="1wk")
@@ -293,6 +331,55 @@ def get_weekly_trend(symbol):
         return "Weekly data unavailable"
 
 
+def get_multi_timeframe_momentum(symbol):
+    """Weighted sum of 1mo+3mo+6mo momentum, replacing the old single 5-day window.
+    Same pattern used by the #1 QuantConnect Dual Momentum strategy (54.81% return, Sharpe 5.02)."""
+    try:
+        hist_long = yf.Ticker(symbol).history(period="7mo")
+        if hist_long.empty or len(hist_long) < MOMENTUM_LOOKBACK_6M:
+            return "N/A", {}
+
+        closes  = hist_long["Close"]
+        current = closes.iloc[-1]
+
+        returns = {
+            "1m": ((current - closes.iloc[-MOMENTUM_LOOKBACK_1M]) / closes.iloc[-MOMENTUM_LOOKBACK_1M]) * 100,
+            "3m": ((current - closes.iloc[-MOMENTUM_LOOKBACK_3M]) / closes.iloc[-MOMENTUM_LOOKBACK_3M]) * 100,
+            "6m": ((current - closes.iloc[-MOMENTUM_LOOKBACK_6M]) / closes.iloc[-MOMENTUM_LOOKBACK_6M]) * 100,
+        }
+        score = (returns["1m"] * MOMENTUM_WEIGHT_1M +
+                 returns["3m"] * MOMENTUM_WEIGHT_3M +
+                 returns["6m"] * MOMENTUM_WEIGHT_6M)
+
+        return round(score, 2), {k: round(v, 2) for k, v in returns.items()}
+    except Exception:
+        return "N/A", {}
+
+
+def get_nq_futures():
+    """Nasdaq futures (NQ=F) direction going into the open — a leading indicator for
+    market direction. yfinance continuous-futures data can be noisy/gappy; treat this
+    as a directional signal, not a precise number."""
+    try:
+        hist = yf.Ticker("NQ=F").history(period="2d", interval="15m")
+        if hist.empty or len(hist) < 2:
+            return None, "NQ futures data unavailable"
+        current = hist["Close"].iloc[-1]
+        reference = hist["Close"].iloc[0]
+        pct = ((current - reference) / reference) * 100
+
+        if pct <= NQ_STRONG_NEGATIVE_PCT:
+            label = f"🔴 NQ futures {pct:+.2f}% — strongly negative pre-market, leading indicator for a weak open"
+        elif pct < 0:
+            label = f"🟡 NQ futures {pct:+.2f}% — modestly negative pre-market"
+        else:
+            label = f"🟢 NQ futures {pct:+.2f}% — positive/flat pre-market"
+        return round(pct, 2), label
+    except Exception as e:
+        return None, f"NQ futures data unavailable ({e})"
+
+
+# ---- DISABLED (feature reduction, July 2026 upgrade session) — see note above get_bollinger_bands ----
 def get_unusual_options(symbol):
     """
     Detects unusual call options activity using yfinance options chain.
@@ -306,7 +393,6 @@ def get_unusual_options(symbol):
         if not expirations:
             return "No options data"
 
-        # Check nearest 2 expirations
         unusual_flags = []
         for expiry in expirations[:2]:
             chain = ticker.option_chain(expiry)
@@ -315,12 +401,10 @@ def get_unusual_options(symbol):
             if calls.empty:
                 continue
 
-            # Filter for meaningful volume
             active_calls = calls[calls["volume"] > UNUSUAL_OPTIONS_MIN_VOLUME]
             if active_calls.empty:
                 continue
 
-            # Check for unusual volume vs open interest
             for _, row in active_calls.iterrows():
                 vol = row.get("volume", 0) or 0
                 oi  = row.get("openInterest", 0) or 0
@@ -448,6 +532,7 @@ def get_price_volume_divergence(hist):
         return "Price/volume divergence data unavailable"
 
 
+# ---- DISABLED (feature reduction, July 2026 upgrade session) — see note above get_bollinger_bands ----
 def get_fear_greed():
     """
     Fetches CNN Fear & Greed Index.
@@ -455,12 +540,6 @@ def get_fear_greed():
     0-25 = Extreme Fear (buy signal), 75-100 = Extreme Greed (caution)
     """
     try:
-        url      = "https://fear-and-greed-index.p.rapidapi.com/v1/fgi"
-        headers  = {
-            "x-rapidapi-host": "fear-and-greed-index.p.rapidapi.com",
-            "x-rapidapi-key": "SIGN-UP-FOR-KEY"
-        }
-        # Try alternative free endpoint first
         alt_url  = "https://api.alternative.me/fng/"
         response = requests.get(alt_url, timeout=5)
         data     = response.json()
@@ -590,6 +669,81 @@ def get_finnhub_data(symbol):
         return f"Finnhub data unavailable ({e})"
 
 
+def unpack_calibration(calibration, symbol):
+    """calibration[symbol] is (optimal_pct, report, best_avg_pnl) today. Once backtest.py
+    is upgraded to also return Sharpe, it'll be a 4-tuple (optimal_pct, report,
+    best_avg_pnl, sharpe). This handles both so MIN_SHARPE/alpha-decay degrade safely
+    (sharpe=None, filters skipped) until that upgrade lands."""
+    entry = calibration.get(symbol, (TRAILING_STOP_PCT, "", None))
+    if len(entry) >= 4:
+        return entry[0], entry[1], entry[2], entry[3]
+    return entry[0], entry[1], entry[2], None
+
+
+def load_alpha_decay_log():
+    try:
+        with open(ALPHA_DECAY_LOG_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_alpha_decay_log(log):
+    try:
+        with open(ALPHA_DECAY_LOG_FILE, "w") as f:
+            json.dump(log, f, indent=2)
+    except Exception as e:
+        print(f"⚠️ Could not save alpha decay log: {e}")
+
+
+def check_alpha_decay(symbol, current_sharpe, log):
+    """Compares current Sharpe to ~1 week ago (5 trading-day entries back in the log).
+    Returns a warning string if it's decayed meaningfully, else None."""
+    if current_sharpe is None:
+        return None
+    history = log.get(symbol, [])
+    if len(history) < 5:
+        return None
+    week_ago_sharpe = history[-5].get("sharpe")
+    if week_ago_sharpe is None:
+        return None
+    drop = week_ago_sharpe - current_sharpe
+    if drop >= ALPHA_DECAY_DROP_THRESHOLD:
+        return (f"⚠️ ALPHA DECAY: Sharpe dropped {drop:.2f} vs ~1wk ago "
+                f"({week_ago_sharpe:.2f} → {current_sharpe:.2f}) — edge may be fading")
+    return None
+
+
+def check_signal_confirmation(symbol):
+    """
+    Used by scheduler.py's conviction-based trailing stop. Returns True if intraday
+    signals still confirm a bullish thesis (price above VWAP, MACD bullish, positive
+    short-term momentum — majority vote of 3), False if they've deteriorated, or None
+    if data is unavailable. Pulls short-interval data only — safe to call every 5 min.
+    """
+    try:
+        hist = yf.Ticker(symbol).history(period="5d", interval="15m")
+        if hist.empty or len(hist) < 30:
+            return None
+
+        _, pct_vs_vwap     = get_vwap(hist)
+        _, _, macd_signal  = get_macd(hist)
+        closes             = hist["Close"]
+        momentum           = ((closes.iloc[-1] - closes.iloc[-10]) / closes.iloc[-10]) * 100 \
+                              if len(closes) >= 10 else 0.0
+
+        above_vwap   = pct_vs_vwap != "N/A" and pct_vs_vwap > 0
+        macd_bullish = "Bullish" in macd_signal or "🟢" in macd_signal
+        momentum_pos = momentum > 0
+
+        confirms = sum([above_vwap, macd_bullish, momentum_pos])
+        if confirms >= 2:
+            return True
+        return False
+    except Exception:
+        return None
+
+
 def calibrate_watchlist_parallel(watchlist):
     print(f"\n📐 Calibrating trailing stops for {len(watchlist)} stocks in parallel...")
     calibration = {}
@@ -602,8 +756,8 @@ def calibrate_watchlist_parallel(watchlist):
         for future in as_completed(future_to_symbol):
             symbol = future_to_symbol[future]
             try:
-                optimal_pct, report, best_avg_pnl = future.result()
-                calibration[symbol] = (optimal_pct, report, best_avg_pnl)
+                result = future.result()
+                calibration[symbol] = result
             except Exception as e:
                 print(f"⚠️ Calibration error for {symbol}: {e}")
                 calibration[symbol] = (TRAILING_STOP_PCT,
@@ -638,13 +792,14 @@ def research_stocks(previously_held=None):
     print("🔍 Building blended watchlist (Alpaca screener + top 12 conviction anchors)...")
     watchlist = get_dynamic_watchlist(top_n=20)
 
-    # Market regime + Fear & Greed (run once, used in prompt)
-    market_regime = get_market_regime()
-    fear_greed    = get_fear_greed()
+    # Market regime (VWAP-primary) + NQ futures pre-market direction
+    market_regime      = get_market_regime()
+    nq_pct, nq_label    = get_nq_futures()
     print(f"📊 Market regime: {market_regime}")
-    print(f"😨 Fear & Greed: {fear_greed}")
+    print(f"📉 {nq_label}")
 
     calibration = calibrate_watchlist_parallel(watchlist)
+    alpha_decay_log = load_alpha_decay_log()
 
     # ---- FILTER 1: Hard block earnings ----
     earnings_blocked     = []
@@ -672,11 +827,11 @@ def research_stocks(previously_held=None):
     if downtrend_blocked:
         print(f"🚫 Downtrend blocked: {', '.join(downtrend_blocked)}")
 
-    # ---- FILTERS 3-6: P&L, conviction, choppy, zero score ----
+    # ---- FILTERS 3-7: P&L, conviction, choppy, zero score, Sharpe ----
     filtered_watchlist = []
     rejected           = []
     for symbol in post_downtrend_filter:
-        optimal_stop, _, best_avg_pnl = calibration.get(symbol, (TRAILING_STOP_PCT, "", None))
+        optimal_stop, _, best_avg_pnl, sharpe = unpack_calibration(calibration, symbol)
         pnl = float(best_avg_pnl) if best_avg_pnl is not None else None
 
         if pnl is None:
@@ -694,6 +849,9 @@ def research_stocks(previously_held=None):
         if optimal_stop < MIN_TRAILING_STOP:
             rejected.append(f"{symbol} (choppy: stop {optimal_stop}% < {MIN_TRAILING_STOP}% min)")
             continue
+        if sharpe is not None and sharpe < MIN_SHARPE:
+            rejected.append(f"{symbol} (low Sharpe: {sharpe:.2f} < {MIN_SHARPE})")
+            continue
 
         filtered_watchlist.append(symbol)
 
@@ -703,7 +861,7 @@ def research_stocks(previously_held=None):
     if not filtered_watchlist:
         print("⚠️ All stocks filtered out — relaxing conviction threshold, keeping positive P&L only")
         for symbol in post_downtrend_filter:
-            _, _, best_avg_pnl = calibration.get(symbol, (TRAILING_STOP_PCT, "", None))
+            _, _, best_avg_pnl, _ = unpack_calibration(calibration, symbol)
             pnl = float(best_avg_pnl) if best_avg_pnl is not None else None
             if pnl is None or pnl > 0:
                 filtered_watchlist.append(symbol)
@@ -742,11 +900,6 @@ def research_stocks(previously_held=None):
             avg_volume = info.get("averageVolume", "N/A")
             market_cap = info.get("marketCap", "N/A")
             rsi        = "N/A"
-            momentum   = "N/A"
-
-            if len(hist) >= 5:
-                closes   = hist["Close"].tolist()
-                momentum = round(((closes[-1] - closes[0]) / closes[0]) * 100, 2)
 
             if len(hist) >= 15:
                 delta      = hist["Close"].diff()
@@ -767,25 +920,38 @@ def research_stocks(previously_held=None):
                 else:
                     volume_flag = f" ✅ Volume confirmed ({volume_ratio}x avg)"
 
-            # All signals
-            vwap, pct_vs_vwap   = get_vwap(hist)
-            vwap_label          = (f"VWAP=${vwap} | Price vs VWAP: {pct_vs_vwap:+.2f}% "
-                                   f"({'above — bullish' if pct_vs_vwap != 'N/A' and pct_vs_vwap > 0 else 'below — bearish'})"
-                                   if pct_vs_vwap != "N/A" else "VWAP: unavailable")
+            # ---- CORE SIGNALS ----
+            vwap, pct_vs_vwap = get_vwap(hist)
+            if pct_vs_vwap != "N/A":
+                vwap_direction = "above — bullish" if pct_vs_vwap > 0 else "below — bearish"
+                vwap_label = f"VWAP=${vwap} | Price vs VWAP: {pct_vs_vwap:+.2f}% ({vwap_direction})"
+            else:
+                vwap_label = "VWAP: unavailable"
 
             macd_val, signal_val, macd_signal = get_macd(hist)
             macd_label = (f"MACD={macd_val} | Signal={signal_val} | {macd_signal}"
                           if macd_val != "N/A" else "MACD: unavailable")
 
-            bb_upper, bb_lower, bb_sma, bb_signal = get_bollinger_bands(hist)
-            bb_label = (f"Bollinger Bands: Upper=${bb_upper} | SMA=${bb_sma} | Lower=${bb_lower} | {bb_signal}"
-                        if bb_upper != "N/A" else "Bollinger Bands: unavailable")
+            rel_strength = get_relative_strength(symbol, hist)
 
-            weekly_trend    = get_weekly_trend(symbol)
-            unusual_options = get_unusual_options(symbol)
-            short_interest  = get_short_interest(ticker)
-            rel_strength    = get_relative_strength(symbol, hist)
-            pv_divergence   = get_price_volume_divergence(hist)
+            optimal_stop, _, best_avg_pnl, sharpe = unpack_calibration(calibration, symbol)
+            pnl_display    = f"{float(best_avg_pnl):+.2f}%" if best_avg_pnl is not None else "N/A"
+            sharpe_display = f"{sharpe:.2f}" if sharpe is not None else "N/A"
+
+            # ---- SECONDARY SIGNALS ----
+            momentum_score, momentum_parts = get_multi_timeframe_momentum(symbol)
+            if momentum_score != "N/A":
+                momentum_label = (f"Momentum Score={momentum_score} "
+                                  f"(1m={momentum_parts.get('1m', 'N/A')}%, "
+                                  f"3m={momentum_parts.get('3m', 'N/A')}%, "
+                                  f"6m={momentum_parts.get('6m', 'N/A')}%)")
+            else:
+                momentum_label = "Momentum Score: unavailable (insufficient history)"
+
+            short_interest = get_short_interest(ticker)
+            pv_divergence  = get_price_volume_divergence(hist)
+
+            decay_flag = check_alpha_decay(symbol, sharpe, alpha_decay_log)
 
             reentry_flag = " 🔄 RE-ENTRY CANDIDATE" if symbol in reentry_candidates else ""
 
@@ -795,36 +961,40 @@ def research_stocks(previously_held=None):
             analyst  = get_analyst_rating(ticker)
             finnhub  = get_finnhub_data(symbol)
 
-            optimal_stop, _, _ = calibration.get(symbol, (TRAILING_STOP_PCT, "", None))
-            _, _, best_avg_pnl = calibration.get(symbol, (TRAILING_STOP_PCT, "", None))
-            pnl_display        = f"{float(best_avg_pnl):+.2f}%" if best_avg_pnl is not None else "N/A"
-
-            summary = (
+            summary_lines = [
                 f"{name} ({symbol}){reentry_flag}: Price=${price}, PE={pe_ratio}, "
                 f"52W High={week_high}, 52W Low={week_low}, "
-                f"RSI={rsi}, 5-Day Momentum={momentum}%, "
-                f"Volume Ratio={volume_ratio}x avg{volume_flag}, Market Cap={market_cap}\n"
-                f"  Earnings: {earnings}\n"
-                f"  Insider Activity: {insider}\n"
-                f"  Analyst Rating: {analyst}\n"
-                f"  News: {news}\n"
-                f"  Cross-check: {finnhub}\n"
-                f"  {vwap_label}\n"
-                f"  {macd_label}\n"
-                f"  {bb_label}\n"
-                f"  Weekly trend: {weekly_trend}\n"
-                f"  Unusual Options: {unusual_options}\n"
-                f"  Short Interest: {short_interest}\n"
-                f"  Relative Strength: {rel_strength}\n"
-                f"  Price/Volume: {pv_divergence}\n"
-                f"  Backtest-calibrated trailing stop: {optimal_stop}% "
-                f"(avg P&L: {pnl_display}, 90-min grace period active after entry)"
-            )
-            results.append({"symbol": symbol, "summary": summary,
+                f"RSI={rsi}, Volume Ratio={volume_ratio}x avg{volume_flag}, Market Cap={market_cap}",
+                f"  Earnings: {earnings}",
+                f"  Insider Activity: {insider}",
+                f"  Analyst Rating: {analyst}",
+                f"  News: {news}",
+                f"  Cross-check: {finnhub}",
+                f"  {vwap_label}",
+                f"  {macd_label}",
+                f"  {rel_strength}",
+                f"  {momentum_label}",
+                f"  Short Interest: {short_interest}",
+                f"  Price/Volume: {pv_divergence}",
+                f"  Backtest-calibrated: trailing stop {optimal_stop}%, avg P&L {pnl_display}, "
+                f"Sharpe {sharpe_display} (90-min grace period active after entry)",
+            ]
+            if decay_flag:
+                summary_lines.append(f"  {decay_flag}")
+
+            results.append({"symbol": symbol, "summary": "\n".join(summary_lines),
                             "optimal_stop": optimal_stop})
+
+            # Log today's Sharpe for next week's alpha-decay comparison
+            if sharpe is not None:
+                alpha_decay_log.setdefault(symbol, []).append(
+                    {"date": datetime.now().strftime("%Y-%m-%d"), "sharpe": sharpe})
+                alpha_decay_log[symbol] = alpha_decay_log[symbol][-30:]
 
         except Exception as e:
             print(f"Error fetching {symbol}: {e}")
+
+    save_alpha_decay_log(alpha_decay_log)
 
     research_data = "\n".join([r["summary"] for r in results])
 
@@ -833,40 +1003,42 @@ def research_stocks(previously_held=None):
         messages=[
             {"role": "system", "content": f"""You are an expert stock research analyst with institutional-grade signal access.
 Current market regime: {market_regime}
-Current Fear & Greed Index: {fear_greed}
+Pre-market leading indicator: {nq_label}
 
-Analyze stocks using all available signals. Signal priority order:
-1. Unusual Options Activity — institutional money moving before price. 🔥 flag = strong buy signal
-2. MACD — 🟢 BULLISH CROSSOVER is the strongest momentum confirmation
-3. Relative Strength vs Sector — stock outperforming its sector = real institutional interest
-4. VWAP — price above VWAP = institutional buying pressure
-5. Short Interest — 🔥 HIGH SHORT INTEREST + positive momentum = squeeze potential
-6. Price/Volume divergence — price up + volume up = strong; price up + volume down = weak
-7. Bollinger Bands — near lower band = oversold bounce; near upper = overbought
-8. Volume confirmation — prefer 1.3x+ average volume
-9. RSI — secondary confirmation only (below 30 = oversold, above 70 = overbought, avoid)
-10. Weekly trend — aligned daily + weekly = stronger signal
-11. Re-entry candidates — passed filters yesterday AND today = extra confirmation
+Analyze stocks using all available signals.
 
-Fear & Greed context:
-- Extreme Fear (0-25): buy quality dips aggressively
-- Fear (25-45): good buying opportunity
-- Neutral (45-55): normal selection
-- Greed (55-75): be selective, require stronger signals
-- Extreme Greed (75-100): very selective, only highest conviction picks
+CORE SIGNALS (weight these most heavily — reduced from 16 signals down to the ones that
+actually carried information; more features than this added noise and overfitting risk,
+not accuracy):
+1. MACD — 🟢 BULLISH CROSSOVER is the strongest momentum confirmation
+2. VWAP — price above VWAP = institutional buying pressure
+3. Volume confirmation — prefer 1.3x+ average volume
+4. Relative Strength vs Sector — stock outperforming its sector = real institutional interest
+5. Backtest-calibrated Sharpe / avg P&L — proven historical edge for this specific stock
+
+SECONDARY SIGNALS (tie-breakers only — don't let these override the core 5 above):
+6. Multi-timeframe Momentum Score (1m+3m+6m weighted) — more robust than single-day momentum
+7. Short Interest — 🔥 HIGH SHORT INTEREST + positive momentum = squeeze potential
+8. Price/Volume divergence — price up + volume up = strong; price up + volume down = weak
+9. RSI — oversold/overbought only (below 30 = oversold, above 70 = overbought, avoid)
+10. Re-entry candidates — passed filters yesterday AND today = extra confirmation
+11. Alpha decay warning — if flagged, treat the Sharpe/P&L numbers as less reliable
+
+Pre-market NQ futures: if strongly negative, reduce to at most 1 pick today and require
+extra confirmation (MACD bullish crossover AND price above VWAP) before taking it, or sit
+out entirely if the market regime is also TRENDING DOWN.
 
 Market regime — regime changes HOW you trade, not WHETHER you trade:
 - TRENDING UP: favor momentum picks, MACD bullish crossover, price above VWAP. Pick all 3 slots.
 - TRENDING DOWN: reduce to 1-2 picks max, require RSI below 50 and price above VWAP.
-- RANGE-BOUND: favor mean reversion — RSI below 40, near Bollinger lower band, above VWAP.
-  Still pick 2-3 stocks. Stocks with strong backtest avg P&L (+1.0%+) and good Sharpe (0.4+)
-  have proven edge even in sideways conditions. DO NOT sit on cash just because it is range-bound.
+- RANGE-BOUND: favor mean reversion — RSI below 40, above VWAP. Still pick 2-3 stocks.
+  Stocks with strong backtest avg P&L (+1.0%+) and good Sharpe (0.4+) have proven edge
+  even in sideways conditions. DO NOT sit on cash just because it is range-bound.
 
 IMPORTANT: You MUST pick at least 1 stock unless EVERY candidate has:
 - Negative backtest avg P&L, AND
 - RSI above 70, AND
-- Price below VWAP, AND
-- No unusual options activity
+- Price below VWAP
 Only then is sitting on cash acceptable.
 
 Always end your response with EXACTLY this format, no bold, no company names, no periods:
@@ -916,7 +1088,7 @@ TOP_PICKS:
     trailing_stops    = {}
     conviction_scores = {}
     for symbol in top_picks:
-        optimal, _, best_avg_pnl = calibration.get(symbol, (TRAILING_STOP_PCT, "", 0.0))
+        optimal, _, best_avg_pnl, _ = unpack_calibration(calibration, symbol)
         trailing_stops[symbol]    = optimal
         conviction_scores[symbol] = float(best_avg_pnl) if best_avg_pnl is not None else 0.0
 
