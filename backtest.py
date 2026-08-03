@@ -1,4 +1,3 @@
-
 """
 Standalone backtester + trailing stop calibrator.
 
@@ -30,7 +29,8 @@ import numpy as np
 # ---- CONFIG ----
 TRAILING_STOP_PCT      = 2.0
 HARD_PROFIT_CEILING    = 3.0
-STOP_LOSS_PCT          = 2.0
+STOP_LOSS_PCT          = 3.0   # kept in sync with scheduler.py's live STOP_LOSS_PCT — calibration
+                                # needs to simulate under the same exit rules the live bot actually uses
 CHECK_INTERVAL_MINUTES = 5
 GRACE_PERIOD_MINUTES   = 90
 
@@ -64,6 +64,15 @@ MONTE_CARLO_SEQUENCE_LEN = 20
 # bounded to a sane range.
 PROFIT_CEILING_MIN = 2.0
 PROFIT_CEILING_MAX = 10.0
+
+# Used ONLY inside calibrate_trailing_stop()'s simulated trades, not the live bot or the
+# standalone run_backtest()/run_atr_backtest() modes. Those simulated trades need room to
+# run past HARD_PROFIT_CEILING (3.0) so MFE can actually be measured — otherwise every
+# simulated trade force-exits at +3% and the "suggested profit ceiling" can never come
+# back above roughly 3%, no matter how far a stock actually tends to run. The real,
+# bounded ceiling (PROFIT_CEILING_MIN-MAX) still gets applied afterward, to the MFE this
+# produces — this constant only removes the artificial cap during measurement.
+CALIBRATION_HARD_CEILING = 15.0
 
 # ---- PARAMETER COUNT AUDIT (new) ----
 # QuantConnect research: keeping parameter count low reduces overfitting risk.
@@ -309,7 +318,7 @@ def simulate_trade(symbol, full_df, entry_price, entry_time,
 
 
 def _run_ticker(symbol, hist, trailing_stop_pct, grace_period_minutes=None,
-                use_atr=False, atr_series=None):
+                use_atr=False, atr_series=None, hard_ceiling=None):
     results      = []
     hist         = hist.copy()
     hist["date"] = hist.index.date
@@ -331,7 +340,8 @@ def _run_ticker(symbol, hist, trailing_stop_pct, grace_period_minutes=None,
                                 trailing_stop_pct=trailing_stop_pct,
                                 grace_period_minutes=grace_period_minutes,
                                 use_atr=use_atr,
-                                atr_series=atr_series)
+                                atr_series=atr_series,
+                                hard_ceiling=hard_ceiling)
         if result:
             result["entry_price"] = entry_price
             result["entry_date"]  = day
@@ -431,7 +441,8 @@ def calibrate_trailing_stop(symbol, days_back=DAYS_BACK):
         for candidate in CALIBRATION_CANDIDATES:
             results = _run_ticker(symbol, train_hist.copy(),
                                   trailing_stop_pct=candidate,
-                                  grace_period_minutes=GRACE_PERIOD_MINUTES)
+                                  grace_period_minutes=GRACE_PERIOD_MINUTES,
+                                  hard_ceiling=CALIBRATION_HARD_CEILING)
             if len(results) < MIN_TRADES_FOR_CALIBRATION:
                 continue
             pnl_list = [r["pnl_pct"] for r in results]
@@ -454,7 +465,8 @@ def calibrate_trailing_stop(symbol, days_back=DAYS_BACK):
         for candidate, train_pnl, train_sharpe in train_candidates:
             val_results = _run_ticker(symbol, validate_hist.copy(),
                                       trailing_stop_pct=candidate,
-                                      grace_period_minutes=GRACE_PERIOD_MINUTES)
+                                      grace_period_minutes=GRACE_PERIOD_MINUTES,
+                                      hard_ceiling=CALIBRATION_HARD_CEILING)
             if not val_results:
                 validate_lines.append(f"  {candidate}%: no validation trades")
                 continue
@@ -493,7 +505,8 @@ def calibrate_trailing_stop(symbol, days_back=DAYS_BACK):
             atr_results = _run_ticker(symbol, validate_hist.copy(),
                                       trailing_stop_pct=TRAILING_STOP_PCT,
                                       grace_period_minutes=GRACE_PERIOD_MINUTES,
-                                      use_atr=True, atr_series=atr_series)
+                                      use_atr=True, atr_series=atr_series,
+                                      hard_ceiling=CALIBRATION_HARD_CEILING)
             if atr_results:
                 atr_pnl_list   = [r["pnl_pct"] for r in atr_results]
                 atr_val_pnl    = float(np.mean(atr_pnl_list))
