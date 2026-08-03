@@ -53,6 +53,8 @@ entry_times              = {}   # datetime of entry — used for grace period (r
 entry_dates              = {}   # date of entry — used for time-limit exit (NOT reset daily, spans the hold)
 trailing_stops            = {}   # calibrated base trailing stop % per symbol (from research_agent/backtest)
 effective_trailing_stops  = {}   # conviction-adjusted trailing stop % actually in force per symbol
+last_signal_confirmation  = {}   # last known True/False/None from get_signal_confirmation per symbol —
+                                  # used so the stop only moves when this actually CHANGES, not every poll
 profit_ceilings           = {}   # per-stock MFE-based profit ceiling % (from research_agent/backtest)
 consecutive_loss_days    = 0
 daily_start_value        = 0.0
@@ -576,6 +578,7 @@ def _update_loss_streak():
 def check_position(symbol, at_close=False):
     global high_water_marks, low_water_marks, todays_symbols, trailing_stops
     global effective_trailing_stops, entry_times, entry_dates, yesterdays_exits, profit_ceilings
+    global last_signal_confirmation
 
     position = monitor_position(symbol)
     if not position:
@@ -596,21 +599,32 @@ def check_position(symbol, at_close=False):
     grace_active        = is_in_grace_period(symbol)
 
     # ---- CONVICTION-BASED TRAILING STOP ----
-    # Only tighten/loosen when intraday signals actually re-confirm or break the thesis —
-    # not on every price wiggle. Falls back to the fixed calibrated stop if
-    # research_agent.check_signal_confirmation isn't available yet.
-    base_stop_pct = get_trailing_stop(symbol)
-    confirmation  = get_signal_confirmation(symbol)
-    if confirmation is True:
-        trailing_stop_pct = min(base_stop_pct * TRAILING_STOP_LOOSEN_FACTOR, TRAILING_STOP_MAX_PCT)
-        conviction_label = " [signals CONFIRM — stop loosened]"
-    elif confirmation is False:
-        trailing_stop_pct = max(base_stop_pct * TRAILING_STOP_TIGHTEN_FACTOR, TRAILING_STOP_MIN_PCT)
-        conviction_label = " [signals DETERIORATING — stop tightened]"
+    # Only tighten/loosen when intraday signals actually CHANGE state from the last check —
+    # not on every 5-min poll, even if the signal comes back the same. Recomputing fresh
+    # from base_stop_pct every poll was causing the stop to whipsaw back and forth on
+    # noisy signal reads even when nothing had really changed. Falls back to the fixed
+    # calibrated stop if research_agent.check_signal_confirmation isn't available.
+    base_stop_pct      = get_trailing_stop(symbol)
+    confirmation       = get_signal_confirmation(symbol)
+    prior_confirmation = last_signal_confirmation.get(symbol)
+
+    if confirmation != prior_confirmation:
+        if confirmation is True:
+            trailing_stop_pct = min(base_stop_pct * TRAILING_STOP_LOOSEN_FACTOR, TRAILING_STOP_MAX_PCT)
+            conviction_label = " [signals CONFIRM — stop loosened]"
+        elif confirmation is False:
+            trailing_stop_pct = max(base_stop_pct * TRAILING_STOP_TIGHTEN_FACTOR, TRAILING_STOP_MIN_PCT)
+            conviction_label = " [signals DETERIORATING — stop tightened]"
+        else:
+            trailing_stop_pct = base_stop_pct
+            conviction_label = ""
+        effective_trailing_stops[symbol] = trailing_stop_pct
+        last_signal_confirmation[symbol] = confirmation
     else:
-        trailing_stop_pct = base_stop_pct
-        conviction_label = ""
-    effective_trailing_stops[symbol] = trailing_stop_pct
+        # No change since last check — hold steady rather than re-deriving from
+        # base_stop_pct again (that repeated re-derivation was the whipsaw).
+        trailing_stop_pct = effective_trailing_stops.get(symbol, base_stop_pct)
+        conviction_label  = " [signals unchanged — stop held]" if symbol in last_signal_confirmation else ""
 
     profit_ceiling = get_profit_ceiling(symbol)
 
@@ -640,6 +654,7 @@ def check_position(symbol, at_close=False):
         trailing_stops.pop(symbol, None)
         effective_trailing_stops.pop(symbol, None)
         profit_ceilings.pop(symbol, None)
+        last_signal_confirmation.pop(symbol, None)
         entry_times.pop(symbol, None)
         entry_dates.pop(symbol, None)
         high_water_marks.pop(symbol, None)
