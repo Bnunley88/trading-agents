@@ -22,6 +22,13 @@ MIN_MARKET_CAP = 10_000_000_000
 # ---- QUALITY FILTERS ----
 MIN_CONVICTION_SCORE = 0.5   # raised back from 0.25 now that the backtest f-string bug is fixed
 MIN_TRAILING_STOP    = 2.5
+# A strong-enough Sharpe overrides the "choppy" rejection below — a stock that wants a
+# tight stop isn't necessarily unreliable, it can just mean it reverses fast and cleanly.
+# Set meaningfully above MIN_SHARPE (0.3) so this only kicks in for genuinely strong
+# cases, not just anything that clears the base bar. UNH (0.665 Sharpe) was the case
+# that prompted this — it was rejected purely for a tight stop despite the best Sharpe
+# in its batch.
+CHOPPY_OVERRIDE_SHARPE = 0.5
 EARNINGS_BLOCK_DAYS  = 5
 DOWNTREND_BLOCK_PCT  = 15.0
 
@@ -30,6 +37,14 @@ DOWNTREND_BLOCK_PCT  = 15.0
 # calibrate_trailing_stop() returns a 4th value (sharpe) — see unpack_calibration() below.
 # Until then this filter is a safe no-op (sharpe reads as None and is skipped).
 MIN_SHARPE = 0.3
+
+# ---- SHORT-SIDE FILTERS (new — mirrors the long-side filters above, inverted) ----
+# A stock qualifies as a short candidate if the LONG backtest shows it consistently
+# losing money — negative avg P&L AND a consistently negative (not just noisy) Sharpe.
+# Deliberately symmetric with MIN_CONVICTION_SCORE/MIN_SHARPE so the bar for "confident
+# this is weak" matches the bar for "confident this is strong" on the long side.
+MIN_SHORT_CONVICTION = -0.5
+MIN_SHORT_SHARPE     = -0.3
 
 # Fallback profit ceiling when calibration doesn't return one — matches scheduler.py's
 # HARD_PROFIT_CEILING fallback, keep these in sync if you change either.
@@ -854,8 +869,12 @@ def research_stocks(previously_held=None):
             rejected.append(f"{symbol} (low conviction: {pnl:+.2f}% < {MIN_CONVICTION_SCORE}%)")
             continue
         if optimal_stop < MIN_TRAILING_STOP:
-            rejected.append(f"{symbol} (choppy: stop {optimal_stop}% < {MIN_TRAILING_STOP}% min)")
-            continue
+            if sharpe is not None and sharpe >= CHOPPY_OVERRIDE_SHARPE:
+                print(f"✅ {symbol}: tight stop ({optimal_stop}%) but Sharpe {sharpe:.2f} "
+                      f">= {CHOPPY_OVERRIDE_SHARPE} override — not treating as choppy")
+            else:
+                rejected.append(f"{symbol} (choppy: stop {optimal_stop}% < {MIN_TRAILING_STOP}% min)")
+                continue
         if sharpe is not None and sharpe < MIN_SHARPE:
             rejected.append(f"{symbol} (low Sharpe: {sharpe:.2f} < {MIN_SHARPE})")
             continue
@@ -1113,8 +1132,220 @@ TOP_PICKS:
         "symbols":           top_picks,
         "trailing_stops":    trailing_stops,
         "profit_ceilings":   profit_ceilings,
-        "conviction_scores": conviction_scores
+        "conviction_scores": conviction_scores,
+        "market_regime":     market_regime
     }
+
+
+def research_shorts(previously_shorted=None):
+    """
+    The 'weakest stocks' filter short_agent.py needed. Mirrors research_stocks()'s
+    pipeline but inverted: reuses the same watchlist, calibration, and signal
+    functions, but looks for stocks the LONG backtest shows consistently LOSING
+    money, then asks GPT-4o to rank them on bearish signals (MACD bearish crossover,
+    price below VWAP, negative relative strength) instead of bullish ones.
+
+    Deliberately does NOT run the downtrend block — for a short candidate, a stock
+    already well below its 30-day high is exactly what you want, not a red flag.
+
+    Returns weakness_scores where more negative = weaker (matches the sign
+    short_agent.compute_short_weights already expects — see its inversion there).
+
+    NOT called anywhere yet. scheduler.py needs to import and call this, gated by
+    an ENABLE_SHORTS flag and a market-regime check (TRENDING DOWN), the same way
+    the options block is gated by ENABLE_OPTIONS. That wiring decision — whether
+    shorts replace reduced equity picks, run alongside them, or only fire when
+    equity sits out entirely — still needs to be made deliberately, not defaulted.
+    """
+    print("\n🔻 Building short candidate watchlist...")
+    watchlist = get_dynamic_watchlist(top_n=20)
+
+    market_regime   = get_market_regime()
+    nq_pct, nq_label = get_nq_futures()
+    print(f"📊 Market regime: {market_regime}")
+    print(f"📉 {nq_label}")
+
+    calibration = calibrate_watchlist_parallel(watchlist)
+
+    # Earnings block still applies — volatility risk cuts both directions, a short
+    # can get squeezed just as hard by a surprise beat as a long can gap down.
+    earnings_blocked     = []
+    post_earnings_filter = []
+    for symbol in watchlist:
+        blocked, days = check_earnings_block(symbol)
+        if blocked:
+            earnings_blocked.append(f"{symbol} (earnings in {days}d)")
+        else:
+            post_earnings_filter.append(symbol)
+
+    if earnings_blocked:
+        print(f"🚫 Earnings blocked: {', '.join(earnings_blocked)}")
+
+    # No downtrend block here on purpose — see docstring.
+    weak_candidates = []
+    rejected        = []
+    for symbol in post_earnings_filter:
+        _, _, best_avg_pnl, sharpe, _ = unpack_calibration(calibration, symbol)
+        pnl = float(best_avg_pnl) if best_avg_pnl is not None else None
+
+        if pnl is None or pnl > MIN_SHORT_CONVICTION:
+            rejected.append(f"{symbol} (not weak enough: "
+                            f"{'N/A' if pnl is None else f'{pnl:+.2f}%'})")
+            continue
+        if sharpe is not None and sharpe > MIN_SHORT_SHARPE:
+            rejected.append(f"{symbol} (Sharpe {sharpe:.2f} not consistently negative)")
+            continue
+
+        weak_candidates.append(symbol)
+
+    if rejected:
+        print(f"🚫 Not weak enough for a short: {', '.join(rejected)}")
+    print(f"✅ Passing {len(weak_candidates)} stocks to GPT-4o for short evaluation: {weak_candidates}\n")
+
+    if not weak_candidates:
+        print("🛑 No stocks weak enough to short today.")
+        return {"report": "No weak-enough short candidates today.", "symbols": [], "weakness_scores": {}}
+
+    reshort_candidates = []
+    if previously_shorted:
+        reshort_candidates = [s for s in previously_shorted if s in weak_candidates]
+
+    results = []
+    for symbol in weak_candidates:
+        try:
+            ticker = yf.Ticker(symbol)
+            info   = ticker.info
+            hist   = ticker.history(period="30d")
+
+            name  = info.get("longName", symbol)
+            price = info.get("currentPrice", "N/A")
+            rsi   = "N/A"
+
+            if len(hist) >= 15:
+                delta      = hist["Close"].diff()
+                gain       = delta.clip(lower=0).rolling(window=14).mean()
+                loss       = (-delta.clip(upper=0)).rolling(window=14).mean()
+                rs         = gain / loss
+                rsi_series = 100 - (100 / (1 + rs))
+                rsi        = round(rsi_series.iloc[-1], 1)
+
+            vwap, pct_vs_vwap = get_vwap(hist)
+            if pct_vs_vwap != "N/A":
+                vwap_direction = "below — bearish" if pct_vs_vwap < 0 else "above — bullish (weak short signal)"
+                vwap_label = f"VWAP=${vwap} | Price vs VWAP: {pct_vs_vwap:+.2f}% ({vwap_direction})"
+            else:
+                vwap_label = "VWAP: unavailable"
+
+            macd_val, signal_val, macd_signal = get_macd(hist)
+            macd_label = (f"MACD={macd_val} | Signal={signal_val} | {macd_signal}"
+                          if macd_val != "N/A" else "MACD: unavailable")
+
+            rel_strength   = get_relative_strength(symbol, hist)
+            short_interest = get_short_interest(ticker)
+            pv_divergence  = get_price_volume_divergence(hist)
+
+            momentum_score, momentum_parts = get_multi_timeframe_momentum(symbol)
+            momentum_label = (f"Momentum Score={momentum_score}" if momentum_score != "N/A"
+                              else "Momentum Score: unavailable")
+
+            _, _, best_avg_pnl, sharpe, _ = unpack_calibration(calibration, symbol)
+            pnl_display    = f"{float(best_avg_pnl):+.2f}%" if best_avg_pnl is not None else "N/A"
+            sharpe_display = f"{sharpe:.2f}" if sharpe is not None else "N/A"
+
+            reshort_flag = " 🔄 RE-SHORT CANDIDATE" if symbol in reshort_candidates else ""
+
+            summary_lines = [
+                f"{name} ({symbol}){reshort_flag}: Price=${price}, RSI={rsi}",
+                f"  {vwap_label}",
+                f"  {macd_label}",
+                f"  {rel_strength}",
+                f"  {momentum_label}",
+                f"  Short Interest: {short_interest}",
+                f"  Price/Volume: {pv_divergence}",
+                f"  Long-side backtest: avg P&L {pnl_display}, Sharpe {sharpe_display} "
+                f"(consistently losing = good short candidate)",
+            ]
+            results.append({"symbol": symbol, "summary": "\n".join(summary_lines),
+                            "weakness_score": float(best_avg_pnl) if best_avg_pnl is not None else 0.0})
+
+        except Exception as e:
+            print(f"Error fetching {symbol}: {e}")
+
+    research_data = "\n".join(r["summary"] for r in results)
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": f"""You are an expert short-seller analyst.
+Current market regime: {market_regime}
+Pre-market leading indicator: {nq_label}
+
+Every stock below already failed its own long-side backtest (consistently losing money
+historically). Your job is to rank them on which is the STRONGEST short right now, using:
+1. MACD — bearish crossover is the strongest confirmation a short thesis is playing out now
+2. VWAP — price below VWAP = selling pressure
+3. Relative Strength vs Sector — underperforming its sector = real weakness, not sector-wide noise
+4. Long-side backtest avg P&L / Sharpe — how consistently this stock has lost money historically
+5. Momentum Score — negative multi-timeframe momentum confirms the weakness is not just noise
+6. Short Interest — very high short interest can mean squeeze risk; weigh against the setup
+7. RSI — AVOID stocks below 30 (already oversold, high risk of a bounce against you)
+8. Re-short candidates — shorted yesterday AND still qualifies today = extra confirmation
+
+Pick the WEAKEST stocks — up to 3. If none show a clear bearish setup (MACD not bearish,
+price not below VWAP, RSI already oversold), it's fine to pick none.
+
+Always end your response with EXACTLY this format, no bold, no company names, no periods:
+TOP_PICKS:
+1: TICKER
+2: TICKER
+3: TICKER
+If fewer than 3 qualify:
+TOP_PICKS:
+1: TICKER"""},
+            {"role": "user", "content": f"Analyze these weak stocks and pick the strongest short candidates:\n{research_data}"}
+        ]
+    )
+
+    recommendation = response.choices[0].message.content
+
+    top_picks = []
+    if "TOP_PICKS:" in recommendation:
+        lines = recommendation.split("TOP_PICKS:")[-1].strip().split("\n")
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            line    = line.replace("**", "").replace("*", "")
+            matches = re.findall(r'\b[A-Z]{2,5}\b', line)
+            for match in matches:
+                if match not in ("TOP", "PICKS", "RSI", "CEO", "ETF", "NYSE", "NA",
+                                 "VWAP", "MACD", "SMA", "EMA", "BB", "OI"):
+                    if match not in top_picks:
+                        top_picks.append(match)
+                        break
+            if len(top_picks) >= 3:
+                break
+
+    if not top_picks:
+        print("🛑 GPT-4o found no strong short setups today.")
+        return {"report": recommendation, "symbols": [], "weakness_scores": {}}
+
+    weakness_scores = {}
+    for symbol in top_picks:
+        _, _, best_avg_pnl, _, _ = unpack_calibration(calibration, symbol)
+        weakness_scores[symbol] = float(best_avg_pnl) if best_avg_pnl is not None else 0.0
+
+    print("SHORT RESEARCH AGENT REPORT:")
+    print(recommendation)
+    print(f"\nSHORT PICKS TODAY: {top_picks}")
+    print(f"🎯 Weakness scores: {weakness_scores}")
+
+    return {
+        "report":          recommendation,
+        "symbols":         top_picks,
+        "weakness_scores": weakness_scores
+    }
+
 
 if __name__ == "__main__":
     research_stocks()
