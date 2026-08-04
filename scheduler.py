@@ -45,6 +45,18 @@ ENABLE_OPTIONS = False
 if ENABLE_OPTIONS:
     from options_agent import buy_call_option
 
+# ---- SHORTS FLAG ----
+# Set to False until you've decided how shorts interact with the existing equity logic
+# (replace reduced TRENDING DOWN picks? run alongside them? only fire when equity sits
+# out entirely?) and verified the live/paper account actually has shorting enabled —
+# short_agent.verify_margin_account() will refuse safely either way, but this flag
+# means the research call and Alpaca hit don't even happen until you're ready.
+ENABLE_SHORTS = False
+
+if ENABLE_SHORTS:
+    from research_agent import research_shorts
+    from short_agent import execute_shorts
+
 # ---- STATE ----
 todays_symbols          = []
 high_water_marks        = {}   # peak price since entry (per symbol) — used for trailing stop
@@ -66,7 +78,9 @@ HARD_PROFIT_CEILING       = 3.0   # fallback used when a symbol has no calibrate
 STOP_LOSS_PCT             = 3.0   # widened from 2.0 — MAE research: 8/9 stopped trades would've recovered at 2%
 TRAILING_STOP_PCT_DEFAULT = 2.0
 GRACE_PERIOD_MINUTES      = 90
-MAX_POSITIONS             = 3
+MAX_POSITIONS             = 5   # nudged up from 3 — days with 9+ candidates passing filters were
+                                 # only using 2-3 slots; lets more of those get taken without
+                                 # changing anything about how each individual trade is sized/exited
 MIN_BUYING_POWER          = 1000.0
 
 # ---- DAILY LOSS LIMIT ----
@@ -541,6 +555,27 @@ def run_morning_session():
 
     time.sleep(3)
     sync_positions_from_alpaca()
+
+    # ---- SHORTS (dormant, ENABLE_SHORTS=False) ----
+    # Entry side only — see the ENABLE_SHORTS comment above and short_agent.py's module
+    # docstring for what's still missing before this can safely go live.
+    if ENABLE_SHORTS:
+        regime = research_result.get("market_regime", "")
+        if "TRENDING DOWN" in regime:
+            print("\n📉 STEP 3c: REGIME IS TRENDING DOWN — EVALUATING SHORTS...")
+            short_result    = research_shorts()
+            short_symbols   = short_result.get("symbols", [])
+            weakness_scores = short_result.get("weakness_scores", {})
+            if short_symbols:
+                print(f"🔻 Short candidates: {short_symbols}")
+                execute_shorts(short_symbols, weakness_scores=weakness_scores, risk_multiplier=risk_mult)
+                print("⚠️ NOTE: short positions are intentionally NOT added to todays_symbols and are "
+                      "NOT monitored by check_position()'s exit logic — that logic assumes long "
+                      "positions (P&L sign, trailing stop direction) and hasn't been adapted for "
+                      "shorts yet. Until that exists, open shorts rely only on short_agent.py's own "
+                      "safeguards (margin gate) — nothing will trail-stop or time-limit-exit them.")
+            else:
+                print("🔻 No qualifying short candidates today.")
 
     print("\n🔍 STEP 3b: VERIFYING FILLS...")
     for symbol in new_symbols:
