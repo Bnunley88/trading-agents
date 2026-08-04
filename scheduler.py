@@ -109,6 +109,15 @@ MARKET_CLOSE_MIN   = 45
 CACHE_FILE    = "calibration_cache.json"
 CACHE_MAX_AGE = timedelta(hours=23)
 
+# ---- POSITION STATE PERSISTENCE (new) ----
+# Railway restarts wipe all in-memory Python state. entry_dates (time-limit exit) and
+# low_water_marks (MAE tracking) were deliberately NOT reset daily because they need to
+# survive across days for a multi-day hold — but they were never surviving a container
+# restart either, which the logs show happening multiple times. This file makes them
+# (plus trailing_stops/profit_ceilings/conviction-stop state, so a mid-day restart
+# doesn't fall back to flat defaults until the next morning session) restart-safe.
+POSITION_STATE_FILE = "position_state_cache.json"
+
 # ---- MAE/MFE LOG (new — feeds backtest.py's per-stock ceiling/stop calibration) ----
 MAE_MFE_LOG_FILE = "mae_mfe_log.json"
 
@@ -144,6 +153,55 @@ def save_calibration_cache(stops_dict, ceilings_dict):
         print(f"💾 Calibration cache saved ({len(stops_dict)} tickers).")
     except Exception as e:
         print(f"⚠️ Could not save calibration cache: {e}")
+
+
+def save_position_state():
+    """Persists the position-lifecycle state that needs to survive a Railway restart,
+    not just a daily reset. Called after every position check (both the exit path and
+    the holding path), so it's always close to current — cheap, small file."""
+    try:
+        data = {
+            "entry_dates":              {s: d.isoformat() for s, d in entry_dates.items()},
+            "low_water_marks":          low_water_marks,
+            "trailing_stops":           trailing_stops,
+            "profit_ceilings":          profit_ceilings,
+            "effective_trailing_stops": effective_trailing_stops,
+            "last_signal_confirmation": last_signal_confirmation,
+        }
+        with open(POSITION_STATE_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"⚠️ Could not save position state cache: {e}")
+
+
+def load_position_state():
+    """Called once at startup. Restores position-lifecycle state from before a restart.
+    sync_positions_from_alpaca() (called right after this, in the schedule) is the
+    source of truth for WHICH positions are actually open — if Alpaca no longer shows a
+    symbol this restores, it just sits unused in these dicts until the next exit/entry
+    touches it, no risk from stale entries."""
+    try:
+        with open(POSITION_STATE_FILE, "r") as f:
+            data = json.load(f)
+
+        for s, d in data.get("entry_dates", {}).items():
+            try:
+                entry_dates[s] = datetime.fromisoformat(d).date()
+            except Exception:
+                pass
+
+        low_water_marks.update(data.get("low_water_marks", {}))
+        trailing_stops.update(data.get("trailing_stops", {}))
+        profit_ceilings.update(data.get("profit_ceilings", {}))
+        effective_trailing_stops.update(data.get("effective_trailing_stops", {}))
+        last_signal_confirmation.update(data.get("last_signal_confirmation", {}))
+
+        print(f"🔁 Restored position state from cache: {len(entry_dates)} entry date(s), "
+              f"{len(trailing_stops)} trailing stop(s), {len(profit_ceilings)} profit ceiling(s)")
+    except FileNotFoundError:
+        print("🔁 No position state cache found — starting fresh.")
+    except Exception as e:
+        print(f"⚠️ Could not load position state cache ({e}) — starting fresh.")
 
 
 def log_mae_mfe(symbol, entry_price, low_price, high_price, exit_price, exit_reason):
@@ -663,6 +721,8 @@ def check_position(symbol, at_close=False):
         if symbol not in yesterdays_exits:
             yesterdays_exits.append(symbol)
 
+        save_position_state()
+
     if pnl >= profit_ceiling:
         print(f"💰 PROFIT CEILING HIT! {symbol} +{pnl:.2f}% (ceiling: {profit_ceiling:.2f}%)")
         _exit("HARD_CEILING")
@@ -696,9 +756,12 @@ def check_position(symbol, at_close=False):
         return
 
     print(f"⏳ Holding {symbol}. P&L within range.")
+    save_position_state()
 
 
 # ---- SCHEDULE ----
+load_position_state()
+
 for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
     getattr(schedule.every(), day).at("09:35").do(run_morning_session)
 
