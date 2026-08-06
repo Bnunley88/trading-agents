@@ -176,6 +176,7 @@ def save_position_state():
     try:
         data = {
             "entry_dates":              {s: d.isoformat() for s, d in entry_dates.items()},
+            "high_water_marks":         high_water_marks,
             "low_water_marks":          low_water_marks,
             "trailing_stops":           trailing_stops,
             "profit_ceilings":          profit_ceilings,
@@ -204,6 +205,7 @@ def load_position_state():
             except Exception:
                 pass
 
+        high_water_marks.update(data.get("high_water_marks", {}))
         low_water_marks.update(data.get("low_water_marks", {}))
         trailing_stops.update(data.get("trailing_stops", {}))
         profit_ceilings.update(data.get("profit_ceilings", {}))
@@ -517,7 +519,12 @@ def run_morning_session():
         return
 
     todays_symbols   = existing_symbols + new_symbols
-    high_water_marks = {}
+    # high_water_marks intentionally NOT reset here anymore — it used to wipe every
+    # morning, which meant a position held more than one day lost its true peak and
+    # the trailing stop understated real risk (see SOFI Aug 4: true peak was $18.70
+    # from the day before, but a nightly/morning reset would've shown $18.20 instead).
+    # It's now only cleared per-symbol on actual exit (see _exit() below), same as the
+    # other position-lifecycle state.
 
     print("\n🧠 STEP 2: ANALYZING OPPORTUNITIES...")
     analyze_recommendation(research_report)
@@ -634,11 +641,11 @@ def run_closing_check():
 
     print(f"🔄 Re-entry candidates saved for tomorrow: {yesterdays_exits}")
 
-    # NOTE: entry_dates / low_water_marks / effective_trailing_stops are intentionally
-    # NOT reset here — they need to persist across days for the time-limit exit and
-    # MAE tracking to work on multi-day holds. Only intraday-only state resets.
+    # NOTE: entry_dates / low_water_marks / high_water_marks / effective_trailing_stops
+    # are intentionally NOT reset here — they need to persist across days for the
+    # time-limit exit, MAE tracking, and true peak-based trailing stop to work on
+    # multi-day holds. Only entry_times (grace period, genuinely intraday-only) resets.
     todays_symbols   = []
-    high_water_marks = {}
     entry_times      = {}
 
 
