@@ -114,10 +114,14 @@ MAX_OPTIONS_CONTRACTS  = 1
 OPTIONS_DAILY_LOSS_PCT = 1.0
 
 # ---- MARKET HOURS (Central Time) ----
-MARKET_OPEN_HOUR   = 9
-MARKET_OPEN_MIN    = 35
-MARKET_CLOSE_HOUR  = 15
-MARKET_CLOSE_MIN   = 45
+MARKET_OPEN_HOUR   = 8    # was 9 — real market opens 8:30 AM Central (9:30 AM ET). The old
+MARKET_OPEN_MIN    = 35   # value (9:35) was an Eastern-Time buffer sitting in Central-Time
+                           # code — the bot was starting its morning session a full hour
+                           # after the real open, missing the most active hour of the day.
+MARKET_CLOSE_HOUR  = 14   # was 15 — real market closes 3:00 PM Central (4:00 PM ET). The old
+MARKET_CLOSE_MIN   = 45   # value (15:45) meant the bot thought the market was still open for
+                           # 45 minutes after it had actually closed — confirmed live via DASH's
+                           # price freezing at the same value for 35+ straight minutes on Aug 6.
 
 # ---- CALIBRATION CACHE ----
 CACHE_FILE    = "calibration_cache.json"
@@ -397,7 +401,7 @@ def run_morning_session():
     global entry_times, entry_dates, effective_trailing_stops, profit_ceilings
     global daily_start_value, consecutive_loss_days, yesterdays_exits, options_daily_cost
 
-    print("\n🌅 MORNING SESSION - 9:35 AM")
+    print("\n🌅 MORNING SESSION - 8:35 AM")
     print("=" * 50)
 
     options_daily_cost = 0.0
@@ -624,7 +628,7 @@ def run_closing_check():
 
     sync_positions_from_alpaca()
 
-    print("\n🌆 CLOSING CHECK - 3:45 PM")
+    print("\n🌆 CLOSING CHECK - 2:45 PM")
     print("=" * 50)
 
     if todays_symbols:
@@ -805,17 +809,17 @@ def check_position(symbol, at_close=False):
 load_position_state()
 
 for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
-    getattr(schedule.every(), day).at("09:35").do(run_morning_session)
+    getattr(schedule.every(), day).at("08:35").do(run_morning_session)
 
 for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
-    getattr(schedule.every(), day).at("15:45").do(run_closing_check)
+    getattr(schedule.every(), day).at("14:45").do(run_closing_check)
 
 schedule.every(5).minutes.do(run_intraday_check)
 
 print("⏰ SCHEDULER RUNNING")
-print("🌅 Morning session: 9:35 AM (calibration loaded from cache if fresh, VIX-adjusted sizing)")
+print("🌅 Morning session: 8:35 AM Central (calibration loaded from cache if fresh, VIX-adjusted sizing)")
 print("🔄 Intraday checks: every 5 min during market hours (silent when no positions)")
-print("🌆 Closing check: 3:45 PM (saves calibration cache, applies Friday-close rule)")
+print("🌆 Closing check: 2:45 PM Central (saves calibration cache, applies Friday-close rule)")
 print(f"🛡️  Stop Loss: -{STOP_LOSS_PCT}% (widened from 2% per MAE research, always active)")
 print(f"⏸️  Grace period: {GRACE_PERIOD_MINUTES} min after entry (trailing stop suppressed)")
 print(f"📉 Trailing Stop: per-stock calibrated, conviction-adjusted "
