@@ -7,6 +7,7 @@ import alpaca_trade_api as tradeapi
 import yfinance as yf
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
+from collections import defaultdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from research_agent import research_stocks
 from analyst_agent import analyze_recommendation
@@ -123,8 +124,18 @@ MARKET_CLOSE_MIN   = 45   # value (15:45) meant the bot thought the market was s
                            # 45 minutes after it had actually closed — confirmed live via DASH's
                            # price freezing at the same value for 35+ straight minutes on Aug 6.
 
+# ---- PERSISTENT DATA DIRECTORY (new) ----
+# Railway's default filesystem is ephemeral — anything written here gets wiped on
+# every redeploy (and possibly every restart). Set DATA_DIR to a mounted Railway
+# Volume's path (e.g. /data) to make calibration cache, position state, and trade
+# history actually survive redeploys instead of silently resetting. Falls back to
+# the regular working directory if DATA_DIR isn't set, so this is safe to deploy
+# before the volume exists — it just won't be durable until the env var is set.
+DATA_DIR = os.getenv("DATA_DIR", ".")
+os.makedirs(DATA_DIR, exist_ok=True)
+
 # ---- CALIBRATION CACHE ----
-CACHE_FILE    = "calibration_cache.json"
+CACHE_FILE    = os.path.join(DATA_DIR, "calibration_cache.json")
 CACHE_MAX_AGE = timedelta(hours=23)
 
 # ---- POSITION STATE PERSISTENCE (new) ----
@@ -134,10 +145,17 @@ CACHE_MAX_AGE = timedelta(hours=23)
 # restart either, which the logs show happening multiple times. This file makes them
 # (plus trailing_stops/profit_ceilings/conviction-stop state, so a mid-day restart
 # doesn't fall back to flat defaults until the next morning session) restart-safe.
-POSITION_STATE_FILE = "position_state_cache.json"
+POSITION_STATE_FILE = os.path.join(DATA_DIR, "position_state_cache.json")
 
 # ---- MAE/MFE LOG (new — feeds backtest.py's per-stock ceiling/stop calibration) ----
-MAE_MFE_LOG_FILE = "mae_mfe_log.json"
+MAE_MFE_LOG_FILE = os.path.join(DATA_DIR, "mae_mfe_log.json")
+
+# ---- DAILY RECORD BOOK (new) ----
+# A running, appended, human-readable log — every closing check's exit-reason and
+# win/loss summary gets appended here with a date header. This is the actual
+# "record book": open the file anytime and read the full history, not just
+# whatever happens to still be in Railway's live log view.
+DAILY_SUMMARY_FILE = os.path.join(DATA_DIR, "daily_summary.log")
 
 
 def load_calibration_cache():
@@ -258,6 +276,111 @@ def log_mae_mfe(symbol, entry_price, low_price, high_price, exit_price, exit_rea
               f"PnL={pnl_pct:.2f}% (reason: {exit_reason})")
     except Exception as e:
         print(f"⚠️ Could not log MAE/MFE for {symbol}: {e}")
+
+
+def build_exit_reason_summary():
+    """
+    Answers 'which mechanism is actually generating profit' directly from real data
+    instead of guessing from memory — reads the full MAE/MFE log and breaks it down by
+    exit reason (TRAILING_STOP, HARD_CEILING, STOP_LOSS, TIME_LIMIT, FRIDAY_CLOSE),
+    with count and average P&L for each. Returns the report text (or None if there's
+    nothing to summarize yet) so the caller can both print it and save it.
+    """
+    try:
+        with open(MAE_MFE_LOG_FILE, "r") as f:
+            log = json.load(f)
+    except Exception:
+        return None
+
+    if not log:
+        return None
+
+    by_reason = defaultdict(list)
+    for entry in log:
+        by_reason[entry.get("exit_reason", "UNKNOWN")].append(entry.get("pnl_pct", 0.0))
+
+    total = len(log)
+    lines = [f"📊 EXIT REASON SUMMARY (all-time, {total} closed trades):"]
+    for reason, pnls in sorted(by_reason.items(), key=lambda kv: -len(kv[1])):
+        count      = len(pnls)
+        avg_pnl    = sum(pnls) / count
+        pct_of_all = (count / total) * 100
+        lines.append(f"   {reason:<15} {count:>3} trades ({pct_of_all:4.0f}%)  avg P&L {avg_pnl:+.2f}%")
+
+    return "\n".join(lines)
+
+
+def build_win_loss_summary():
+    """
+    Win rate, avg winner size vs avg loser size, and profit factor — the numbers that
+    actually determine profitability, not win rate alone (per the FXCM research: 62%
+    win rate still lost money because losses ran ~2x bigger than wins — "it's not the
+    size of the dog in the fight, it's the size of the fight in the dog"). Also shows
+    HOW winners and losers each closed out. Returns the report text (or None).
+    """
+    try:
+        with open(MAE_MFE_LOG_FILE, "r") as f:
+            log = json.load(f)
+    except Exception:
+        return None
+
+    if not log:
+        return None
+
+    winners = [e for e in log if e.get("pnl_pct", 0.0) > 0]
+    losers  = [e for e in log if e.get("pnl_pct", 0.0) <= 0]
+    total   = len(log)
+
+    win_count  = len(winners)
+    loss_count = len(losers)
+    win_rate   = (win_count / total) * 100 if total else 0.0
+
+    avg_winner = (sum(e["pnl_pct"] for e in winners) / win_count) if win_count else 0.0
+    avg_loser  = (sum(e["pnl_pct"] for e in losers) / loss_count) if loss_count else 0.0
+
+    gross_win  = sum(e["pnl_pct"] for e in winners)
+    gross_loss = abs(sum(e["pnl_pct"] for e in losers))
+    profit_factor = (gross_win / gross_loss) if gross_loss > 0 else None
+
+    lines = [
+        f"📊 WIN/LOSS SUMMARY (all-time, {total} closed trades):",
+        f"   Win rate: {win_rate:.0f}% ({win_count} winners / {loss_count} losers)",
+        f"   Avg winner: {avg_winner:+.2f}%  |  Avg loser: {avg_loser:+.2f}%",
+    ]
+    if avg_loser != 0:
+        lines.append(f"   Winner/loser size ratio: {abs(avg_winner / avg_loser):.2f}x "
+                     f"(want this comfortably above 1.0x — bigger wins than losses)")
+    lines.append(f"   Profit factor: "
+                 f"{f'{profit_factor:.2f}' if profit_factor is not None else 'N/A (no losses yet)'}")
+
+    def _breakdown(label, trades):
+        if not trades:
+            return f"   {label} closed via: none yet"
+        by_reason = defaultdict(int)
+        for e in trades:
+            by_reason[e.get("exit_reason", "UNKNOWN")] += 1
+        parts = ", ".join(f"{reason} x{count}"
+                          for reason, count in sorted(by_reason.items(), key=lambda kv: -kv[1]))
+        return f"   {label} closed via: {parts}"
+
+    lines.append(_breakdown("Winners", winners))
+    lines.append(_breakdown("Losers", losers))
+
+    return "\n".join(lines)
+
+
+def append_daily_record(text):
+    """Appends a dated entry to the persistent record book. Only actually durable
+    once DATA_DIR points at a mounted Railway Volume — otherwise it still works, it
+    just resets on the next redeploy like everything else did before the volume."""
+    try:
+        with open(DAILY_SUMMARY_FILE, "a") as f:
+            f.write(f"\n{'=' * 60}\n{datetime.now().strftime('%Y-%m-%d %H:%M')}\n{'=' * 60}\n")
+            f.write(text + "\n")
+    except Exception as e:
+        print(f"⚠️ Could not write to daily record book: {e}")
+
+
 
 
 def get_vix():
@@ -644,6 +767,18 @@ def run_closing_check():
         save_calibration_cache(trailing_stops, profit_ceilings)
 
     print(f"🔄 Re-entry candidates saved for tomorrow: {yesterdays_exits}")
+
+    exit_summary     = build_exit_reason_summary()
+    win_loss_summary = build_win_loss_summary()
+
+    if exit_summary:
+        print(f"\n{exit_summary}")
+    if win_loss_summary:
+        print(f"\n{win_loss_summary}")
+
+    record_parts = [t for t in (exit_summary, win_loss_summary) if t]
+    if record_parts:
+        append_daily_record("\n\n".join(record_parts))
 
     # NOTE: entry_dates / low_water_marks / high_water_marks / effective_trailing_stops
     # are intentionally NOT reset here — they need to persist across days for the
