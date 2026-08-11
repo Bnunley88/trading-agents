@@ -77,7 +77,7 @@ MOMENTUM_WEIGHT_6M   = 1.0
 NQ_STRONG_NEGATIVE_PCT = -0.5   # below this, treat as a strongly negative leading indicator
 
 # ---- ALPHA DECAY MONITORING ----
-ALPHA_DECAY_LOG_FILE       = "alpha_decay_log.json"
+ALPHA_DECAY_LOG_FILE       = os.path.join(os.getenv("DATA_DIR", "."), "alpha_decay_log.json")
 ALPHA_DECAY_DROP_THRESHOLD = 0.3   # Sharpe drop vs ~1wk ago that counts as meaningful decay
 
 # ---- SECTOR ETF MAP for relative strength ----
