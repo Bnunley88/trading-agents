@@ -849,10 +849,19 @@ def check_position(symbol, at_close=False):
 
     if confirmation != prior_confirmation:
         if confirmation is True:
-            trailing_stop_pct = min(base_stop_pct * TRAILING_STOP_LOOSEN_FACTOR, TRAILING_STOP_MAX_PCT)
+            trailing_stop_pct = min(max(base_stop_pct * TRAILING_STOP_LOOSEN_FACTOR, TRAILING_STOP_MIN_PCT),
+                                    TRAILING_STOP_MAX_PCT)
             conviction_label = " [signals CONFIRM — stop loosened]"
         elif confirmation is False:
-            trailing_stop_pct = max(base_stop_pct * TRAILING_STOP_TIGHTEN_FACTOR, TRAILING_STOP_MIN_PCT)
+            # Both floor AND ceiling applied here now — previously this branch only had
+            # a floor, so a high-base stock (e.g. IREN's 8.0% calibrated base) could
+            # produce a "tightened" number (8.0*0.6=4.8) actually WIDER than the capped
+            # "loosened" number (min(8.0*1.15, 4.0)=4.0) — the exact inversion caught
+            # live on Aug 11 (IREN went 4.00% loosened -> 4.80% "tightened"). Clamping
+            # both branches to the same [MIN,MAX] range guarantees tighten <= loosen
+            # for any base_stop_pct, since 0.6x < 1.15x always and clamp() is monotonic.
+            trailing_stop_pct = min(max(base_stop_pct * TRAILING_STOP_TIGHTEN_FACTOR, TRAILING_STOP_MIN_PCT),
+                                    TRAILING_STOP_MAX_PCT)
             conviction_label = " [signals DETERIORATING — stop tightened]"
         else:
             trailing_stop_pct = base_stop_pct
