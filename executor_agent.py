@@ -140,7 +140,16 @@ def execute_trade(symbol, shares=None, risk_pct=None):
                     qty=shares,
                     side="buy",
                     type="market",
-                    time_in_force="day",
+                    time_in_force="gtc",   # was "day" — Alpaca applies one time_in_force to
+                                            # BOTH legs of an OTO order, so "day" meant the
+                                            # protective stop-loss silently expired at every
+                                            # market close and never got resubmitted. Live
+                                            # evidence: DASH's Aug 12 stop showed "expired" at
+                                            # 3:00 PM that day while the position was still
+                                            # held into Aug 13+ with zero broker-level
+                                            # protection since. GTC keeps the stop-loss leg
+                                            # alive for the whole hold, only ending when
+                                            # exit_agent.py explicitly cancels it or it fills.
                     order_class="oto",
                     stop_loss=dict(stop_price=stop_price)
                 )
