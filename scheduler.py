@@ -278,6 +278,108 @@ def log_mae_mfe(symbol, entry_price, low_price, high_price, exit_price, exit_rea
         print(f"⚠️ Could not log MAE/MFE for {symbol}: {e}")
 
 
+RECONCILIATION_LOOKBACK_HOURS = 48   # covers weekends/holidays safely without re-scanning too far
+
+
+def reconcile_untracked_exits():
+    """
+    Daily reconciliation — catches ANY closed position missing from mae_mfe_log.json,
+    not just the specific broker-stop-fill case that surfaced this (SMCI, Aug 12: the
+    stop-loss filled directly 4 minutes after entry, faster than the bot's own polling
+    could react, so _exit() never ran and the trade vanished from tracking entirely).
+
+    Rather than special-case that one failure mode, this compares Alpaca's actual filled
+    sell orders — the ground truth — against what's already logged, and backfills
+    anything missing. Catches broker stop-fills, but also anything else that could slip
+    through (a manual trade, a future edge case neither of us has hit yet).
+
+    Honest limitation: true intraday MAE/MFE (the exact peak/trough during the hold)
+    isn't reconstructable after the fact without minute-by-minute historical data we
+    don't have — backfilled entries use entry/exit price as a best-effort floor/ceiling,
+    which will under-report the real MAE/MFE. This does NOT affect the exit-reason or
+    win/loss summaries (those only need pnl_pct and exit_reason, both reconstructed
+    accurately from real fill prices) — it only means backfilled trades contribute less
+    precise data to backtest.py's stop/ceiling calibration than a normally-logged trade.
+    """
+    try:
+        since = (datetime.now() - timedelta(hours=RECONCILIATION_LOOKBACK_HOURS)).isoformat()
+        orders = api.list_orders(status="closed", after=since, direction="asc", limit=500)
+    except Exception as e:
+        print(f"⚠️ RECONCILIATION: Could not fetch order history: {e}")
+        return
+
+    filled_sells = [o for o in orders
+                    if getattr(o, "side", None) == "sell" and getattr(o, "status", None) == "filled"
+                    and getattr(o, "filled_at", None)]
+    if not filled_sells:
+        print("🔍 RECONCILIATION: No filled sells in lookback window — nothing to check.")
+        return
+
+    try:
+        with open(MAE_MFE_LOG_FILE, "r") as f:
+            existing_log = json.load(f)
+    except Exception:
+        existing_log = []
+
+    # Loose match key: (symbol, exit date) — exact timestamp formatting can differ
+    # between what we log ourselves and what Alpaca reports, date-level is reliable enough
+    logged_keys = set()
+    for entry in existing_log:
+        try:
+            logged_keys.add((entry.get("symbol"), str(entry.get("exit_time", ""))[:10]))
+        except Exception:
+            continue
+
+    reconciled = 0
+    for sell_order in filled_sells:
+        symbol    = sell_order.symbol
+        filled_at = sell_order.filled_at
+        exit_date = str(filled_at)[:10]
+
+        if (symbol, exit_date) in logged_keys:
+            continue
+
+        exit_price = float(sell_order.filled_avg_price) if sell_order.filled_avg_price else None
+        if exit_price is None:
+            continue
+
+        entry_price = None
+        try:
+            buy_orders = [o for o in orders
+                         if getattr(o, "symbol", None) == symbol and getattr(o, "side", None) == "buy"
+                         and getattr(o, "status", None) == "filled" and getattr(o, "filled_at", None)
+                         and o.filled_at < filled_at]
+            if buy_orders:
+                buy_orders.sort(key=lambda o: o.filled_at)
+                entry_price = float(buy_orders[-1].filled_avg_price)
+        except Exception:
+            pass
+
+        if entry_price is None:
+            print(f"⚠️ RECONCILIATION: Found untracked exit for {symbol} on {exit_date} but "
+                  f"couldn't find a matching buy order — skipping, check Alpaca manually.")
+            continue
+
+        order_type = getattr(sell_order, "type", "unknown")
+        reason = "BROKER_STOP_FILL" if order_type == "stop" else "RECONCILED_UNTRACKED"
+
+        log_mae_mfe(
+            symbol=symbol,
+            entry_price=entry_price,
+            low_price=min(entry_price, exit_price),    # best-effort — see docstring
+            high_price=max(entry_price, exit_price),   # best-effort — see docstring
+            exit_price=exit_price,
+            exit_reason=reason,
+        )
+        reconciled += 1
+
+    if reconciled:
+        print(f"🔍 RECONCILIATION: Backfilled {reconciled} previously untracked exit(s) "
+              f"into the record book.")
+    else:
+        print("🔍 RECONCILIATION: All closed positions already accounted for — record book is current.")
+
+
 def build_exit_reason_summary():
     """
     Answers 'which mechanism is actually generating profit' directly from real data
@@ -767,6 +869,8 @@ def run_closing_check():
         save_calibration_cache(trailing_stops, profit_ceilings)
 
     print(f"🔄 Re-entry candidates saved for tomorrow: {yesterdays_exits}")
+
+    reconcile_untracked_exits()
 
     exit_summary     = build_exit_reason_summary()
     win_loss_summary = build_win_loss_summary()
