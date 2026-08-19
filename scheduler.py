@@ -302,7 +302,10 @@ def reconcile_untracked_exits():
     precise data to backtest.py's stop/ceiling calibration than a normally-logged trade.
     """
     try:
-        since = (datetime.now() - timedelta(hours=RECONCILIATION_LOOKBACK_HOURS)).isoformat()
+        # Alpaca's 'after' param needs RFC3339 with a literal Z suffix, no microseconds —
+        # plain .isoformat() produces neither (local time, microseconds included, no Z),
+        # which is exactly what broke this on Aug 14 ("invalid format for after").
+        since = (datetime.utcnow() - timedelta(hours=RECONCILIATION_LOOKBACK_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
         orders = api.list_orders(status="closed", after=since, direction="asc", limit=500)
     except Exception as e:
         print(f"⚠️ RECONCILIATION: Could not fetch order history: {e}")
