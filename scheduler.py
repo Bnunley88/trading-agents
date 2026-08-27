@@ -713,6 +713,16 @@ def run_morning_session():
 
     print("\n📊 STEP 1: RESEARCHING STOCKS + CALIBRATING TRAILING STOPS...")
     research_result = research_stocks(previously_held=yesterdays_exits)
+
+    # yesterdays_exits has now served its purpose for today's re-entry check — reset it
+    # here so it only accumulates TODAY's exits from here on, not every exit since the
+    # bot started. Previously this list was never cleared anywhere, so it grew forever:
+    # a symbol that exited weeks ago would still show up in "re-entry candidates" every
+    # single day after, which is exactly backwards from what the feature is supposed to
+    # mean ("this is what we JUST let go of"). Caught live on Aug 26 — BMNR appeared in
+    # the re-entry list on a day its position was actually still open and holding.
+    yesterdays_exits = []
+
     research_report = research_result["report"]
     top_symbols     = research_result["symbols"]
     new_stops       = research_result.get("trailing_stops", {})
