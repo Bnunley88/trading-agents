@@ -63,11 +63,13 @@ MONTE_CARLO_SEQUENCE_LEN = 20
 # stock actually tends to run (mean MFE of the winning stop's validation trades),
 # bounded to a sane range.
 PROFIT_CEILING_MIN = 2.0
-PROFIT_CEILING_MAX = 5.5   # lowered from 10.0 — this bot is meant to convert consistent
-                           # monthly gains via the trailing stop, not hold out for a rare
-                           # 10%+ runner. FIG landing at exactly 10.00% (the old cap) was
-                           # the tell that its true average MFE was higher than that, not
-                           # a realistic target to keep chasing.
+PROFIT_CEILING_MAX = 6.5   # raised from 5.5 on Aug 21 — real evidence the 5.5 cap was binding:
+                           # SPCX closed at +5.86% (past its 5.5% ceiling, price moved between
+                           # polls) and 5 of 7 winners were closing via HARD_CEILING vs the
+                           # target of ~30%. 6.5 sits inside the normal calibrated range seen
+                           # across stocks (SOFI 5.14%, SNOW 7.17%, PLTR 3.00%) rather than
+                           # reaching back toward FIG's 10% outlier that caused the original
+                           # lowering. Was 10.0 -> 5.5 (Aug 5) -> 6.5 (Aug 21).
 
 # Used ONLY inside calibrate_trailing_stop()'s simulated trades, not the live bot or the
 # standalone run_backtest()/run_atr_backtest() modes. Those simulated trades need room to
