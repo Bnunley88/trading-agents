@@ -6,11 +6,14 @@ import threading
 import alpaca_trade_api as tradeapi
 import yfinance as yf
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from research_agent import research_stocks
-from analyst_agent import analyze_recommendation
+# analyst_agent import REMOVED (Nov 9 2026) — analyze_recommendation() called gpt-3.5-turbo,
+# which OpenAI retired. The 404 crashed every morning session right before STEP 3, so no
+# trades executed. Its output was never used in the buy decision anyway. analyst_agent.py
+# stays in the repo in case the "weigh signals together" design gets built properly later.
 from executor_agent import execute_trades
 from monitor_agent import monitor_position
 from exit_agent import exit_trade
@@ -305,7 +308,9 @@ def reconcile_untracked_exits():
         # Alpaca's 'after' param needs RFC3339 with a literal Z suffix, no microseconds —
         # plain .isoformat() produces neither (local time, microseconds included, no Z),
         # which is exactly what broke this on Aug 14 ("invalid format for after").
-        since = (datetime.utcnow() - timedelta(hours=RECONCILIATION_LOOKBACK_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # datetime.now(timezone.utc) replaces the deprecated datetime.utcnow() (Nov 9 2026) —
+        # same UTC time, same output string, just clears the DeprecationWarning in the logs.
+        since = (datetime.now(timezone.utc) - timedelta(hours=RECONCILIATION_LOOKBACK_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
         orders = api.list_orders(status="closed", after=since, direction="asc", limit=500)
     except Exception as e:
         print(f"⚠️ RECONCILIATION: Could not fetch order history: {e}")
@@ -768,8 +773,9 @@ def run_morning_session():
     # It's now only cleared per-symbol on actual exit (see _exit() below), same as the
     # other position-lifecycle state.
 
-    print("\n🧠 STEP 2: ANALYZING OPPORTUNITIES...")
-    analyze_recommendation(research_report)
+    # STEP 2 (analyst_agent / gpt-3.5-turbo) REMOVED Nov 9 2026 — see note at the imports.
+    # This call crashed every morning session right here, before STEP 3 could place
+    # any orders. research_report is still printed by research_agent itself.
 
     print("\n⚡ STEP 3: EXECUTING TRADES...")
     print(f"Already holding: {existing_symbols}")
